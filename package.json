@@ -1,9 +1,0 @@
-{
-  "name": "pokemon-text-battle-github-pages",
-  "version": "5.0.0",
-  "private": true,
-  "description": "Static GitHub Pages Pokémon text battle simulator with Supabase persistence",
-  "scripts": {
-    "check": "node --check public/battle-engine.js"
-  }
-}
