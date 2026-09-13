@@ -1,0 +1,940 @@
+const path = require("path");
+const fs = require("fs");
+const crypto = require("crypto");
+const express = require("express");
+const session = require("express-session");
+const rateLimit = require("express-rate-limit");
+const helmet = require("helmet");
+const bcrypt = require("bcryptjs");
+const { getStore } = require("@netlify/blobs");
+
+const app = express();
+const PORT = Number(process.env.PORT || 3000);
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || "deveropper0510";
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "1";
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, ".data");
+fs.mkdirSync(DATA_DIR, { recursive: true });
+const LOCAL_DATA_PATH = path.join(DATA_DIR, "blobs-data.json");
+// Do not create DATA_DIR during Netlify Function initialization: /var/task is read-only.
+// Local storage is created only when saveData() actually needs to write to it.
+class NetlifyBlobSessionStore extends session.Store {
+  constructor() {
+    super();
+    this.prefix = process.env.NETLIFY_BLOBS_SESSION_PREFIX || "session";
+  }
+  key(sid) { return `${this.prefix}:${sid}`; }
+  async getAsync(sid) {
+    const data = await blobStore().get(this.key(sid), { type: "json" });
+    if (!data) return null;
+    const expires = data?.cookie?.expires ? new Date(data.cookie.expires).getTime() : null;
+    if (expires && expires <= Date.now()) {
+      await blobStore().delete(this.key(sid));
+      return null;
+    }
+    return data;
+  }
+  get(sid, cb) {
+    this.getAsync(sid).then(data => cb(null, data)).catch(err => cb(err));
+  }
+  set(sid, sess, cb) {
+    const expiresAt = sess?.cookie?.expires || null;
+    blobStore().set(this.key(sid), JSON.stringify(sess), {
+      metadata: { expiresAt: expiresAt || "" }
+    }).then(() => cb && cb(null)).catch(err => cb && cb(err));
+  }
+  destroy(sid, cb) {
+    blobStore().delete(this.key(sid)).then(() => cb && cb(null)).catch(err => cb && cb(err));
+  }
+  touch(sid, sess, cb) {
+    this.set(sid, sess, cb);
+  }
+}
+
+const BLOB_STORE_NAME = process.env.NETLIFY_BLOBS_STORE || "pokemon-text-battle";
+const SESSION_SECRET = process.env.SESSION_SECRET || crypto.createHash("sha256").update(`pokemon-text-battle-session-v1:${BLOB_STORE_NAME}:${ADMIN_USERNAME}:${ADMIN_PASSWORD}`).digest("hex");
+
+const memoryData = { users: [], content: [], nextUserId: 1, nextContentId: 1 };
+let dataLoaded = false;
+let dataLoading = null;
+let saveQueue = Promise.resolve();
+
+function isNetlifyRuntime(){ return Boolean(process.env.NETLIFY || process.env.NETLIFY_FUNCTIONS || process.env.NETLIFY_BLOBS_CONTEXT); }
+function blobStore(){ return getStore(BLOB_STORE_NAME); }
+async function loadData(){
+  if(dataLoaded) return;
+  if(dataLoading) return dataLoading;
+  dataLoading=(async()=>{
+    let parsed=null;
+    try {
+      if(isNetlifyRuntime()) {
+        parsed=await blobStore().get("database.json", { type:"json" });
+      } else if(fs.existsSync(LOCAL_DATA_PATH)) {
+        parsed=JSON.parse(fs.readFileSync(LOCAL_DATA_PATH,"utf8"));
+      }
+    } catch(err){ console.warn("Persistent data load failed; starting with empty data:", err.message); }
+    if(parsed && typeof parsed === "object"){
+      memoryData.users=Array.isArray(parsed.users)?parsed.users:[];
+      memoryData.content=Array.isArray(parsed.content)?parsed.content:[];
+      memoryData.nextUserId=Number(parsed.nextUserId)||((memoryData.users.reduce((m,x)=>Math.max(m,Number(x.id)||0),0))+1);
+      memoryData.nextContentId=Number(parsed.nextContentId)||((memoryData.content.reduce((m,x)=>Math.max(m,Number(x.id)||0),0))+1);
+    }
+    dataLoaded=true;
+    await ensureAdmin();
+  })().finally(()=>{dataLoading=null;});
+  return dataLoading;
+}
+function saveData(){
+  const payload=JSON.stringify(memoryData);
+  saveQueue=saveQueue.then(async()=>{
+    if(isNetlifyRuntime()) await blobStore().set("database.json", payload, { metadata:{updatedAt:new Date().toISOString()} });
+    else fs.writeFileSync(LOCAL_DATA_PATH,payload,"utf8");
+  });
+  return saveQueue;
+}
+async function ensureDataLoaded(req,res,next){ try{ await loadData(); next(); }catch(err){ console.error(err); res.status(500).json({error:"データストアの読み込みに失敗しました。"}); } }
+
+async function ensureAdmin() {
+  let row = memoryData.users.find(u=>u.username===ADMIN_USERNAME);
+  const hash = bcrypt.hashSync(ADMIN_PASSWORD, 12);
+  if (!row) {
+    row={id:memoryData.nextUserId++,username:ADMIN_USERNAME,password_hash:hash,role:"developer",enabled:1,created_at:new Date().toISOString()};
+    memoryData.users.push(row);
+    console.log(`Created developer account: ${ADMIN_USERNAME}`);
+  } else {
+    row.password_hash=hash; row.role="developer"; row.enabled=1;
+  }
+  await saveData();
+}
+
+app.set("trust proxy", 1);
+app.use(helmet({ contentSecurityPolicy: false }));
+app.use(express.json({ limit: "100kb" }));
+app.use(express.urlencoded({ extended: false }));
+
+app.use(ensureDataLoaded);
+
+const sessionOptions = {
+  name: "pokemon_sid",
+  secret: SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: isNetlifyRuntime() || process.env.NODE_ENV === "production",
+    maxAge: 1000 * 60 * 60 * 8
+  }
+};
+if (isNetlifyRuntime()) sessionOptions.store = new NetlifyBlobSessionStore();
+app.use(session(sessionOptions));
+
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 20,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  message: { error: "ログイン試行回数が多すぎます。しばらく待ってください。" }
+});
+
+function currentUser(req) {
+  if (!req.session.user) return null;
+  const u=memoryData.users.find(x=>Number(x.id)===Number(req.session.user.id));
+  return u ? {id:u.id,username:u.username,role:u.role,enabled:u.enabled} : null;
+}
+function requireLogin(req, res, next) {
+  const user = currentUser(req);
+  if (!user || !user.enabled) {
+    if (req.session.user) req.session.destroy(() => {});
+    return res.status(401).json({ error: "ログインが必要です。" });
+  }
+  req.currentUser = user;
+  next();
+}
+function requireDeveloper(req, res, next) {
+  if (!req.currentUser || req.currentUser.role !== "developer") {
+    return res.status(403).json({ error: "開発者権限が必要です。" });
+  }
+  next();
+}
+function requirePageLogin(req, res, next) {
+  const user = currentUser(req);
+  if (!user || !user.enabled) return res.redirect("/");
+  req.currentUser = user;
+  next();
+}
+function requireDeveloperPage(req, res, next) {
+  const user = currentUser(req);
+  if (!user || !user.enabled || user.role !== "developer") return res.redirect("/");
+  req.currentUser = user;
+  next();
+}
+
+app.post("/api/login", loginLimiter, (req, res) => {
+  const { username, password } = req.body || {};
+  if (!username || !password) return res.status(400).json({ error: "ユーザー名とパスワードを入力してください。" });
+  const user = memoryData.users.find(u => u.username === String(username).trim());
+  if (!user || !user.enabled || !bcrypt.compareSync(password, user.password_hash)) {
+    return res.status(401).json({ error: "ユーザー名またはパスワードが正しくありません。" });
+  }
+  req.session.regenerate(err => {
+    if (err) return res.status(500).json({ error: "ログイン処理に失敗しました。" });
+    req.session.user = { id: user.id };
+    req.session.save(saveErr => {
+      if (saveErr) return res.status(500).json({ error: "ログイン情報の保存に失敗しました。" });
+      res.json({ username: user.username, role: user.role });
+    });
+  });
+});
+
+app.post("/api/logout", requireLogin, (req, res) => {
+  req.session.destroy(() => res.json({ ok: true }));
+});
+app.get("/api/me", requireLogin, (req, res) => res.json(req.currentUser));
+
+function readContent(kind) {
+  return memoryData.content.filter(r=>r.kind===kind).sort((a,b)=>a.id-b.id).map(r=>({id:r.id,kind:r.kind,data:r.data}));
+}
+app.get("/api/content", requireLogin, (req, res) => {
+  const rows = memoryData.content.slice().sort((a,b)=>a.id-b.id);
+  res.json(rows.map(r => ({ id:r.id, kind:r.kind, data:r.data })));
+});
+app.post("/api/content", requireLogin, requireDeveloper, async (req, res) => {
+  const { kind, data } = req.body || {};
+  const allowed = ["species", "ability", "item", "move", "enemy_team"];
+  if (!allowed.includes(kind) || !data || typeof data !== "object") {
+    return res.status(400).json({ error: "登録データが不正です。" });
+  }
+  if(kind === "species") {
+    const statKeys=["hp","attack","defense","spAttack","spDefense","speed"];
+    data.evs=data.evs&&typeof data.evs==="object"?data.evs:{};
+    for(const key of statKeys) data.evs[key]=clamp(Number(data.evs[key]??0),0,32);
+    const natureStats=["attack","defense","spAttack","spDefense","speed"];
+    data.personality=data.personality&&typeof data.personality==="object"?data.personality:{};
+    data.personality.up=natureStats.includes(data.personality.up)?data.personality.up:null;
+    data.personality.down=natureStats.includes(data.personality.down)?data.personality.down:null;
+    if(data.personality.up && data.personality.up===data.personality.down) return res.status(400).json({error:"性格補正の上昇と下降には別の能力を指定してください。"});
+  }
+  if(kind === "move") {
+    data.effectChance = clamp(Number(data.effectChance ?? 100),0,100);
+    data.contact = data.contact === true;
+    data.ineffectiveTypes = Array.isArray(data.ineffectiveTypes) ? data.ineffectiveTypes.filter(t=>ALL_TYPES.includes(t)) : [];
+    data.effects = Array.isArray(data.effects) ? [...new Set(data.effects.filter(Boolean))] : (data.effect ? [data.effect] : []);
+    data.effect = data.effects[0] || null;
+    data.target = ["field","self","opponent"].includes(data.target) ? data.target : "opponent";
+    if(data.effect === "stat_boost" || data.effect === "stat_drop") {
+      if(!STAT_NAMES[data.effectStat]) return res.status(400).json({error:"能力変化の対象能力が不正です。"});
+      data.effectStages = clamp(Number(data.effectStages ?? 1),1,3);
+      data.effectTarget = data.effectTarget === "opponent" ? "opponent" : "self";
+    } else { data.effectStat=null; data.effectStages=null; data.effectTarget=null; }
+    if(data.effects.includes("change_opponent_type")) {
+      data.effectAddTypes = Array.isArray(data.effectAddTypes) ? data.effectAddTypes.filter(t=>ALL_TYPES.includes(t)) : [];
+      if(!data.effectAddTypes.length) return res.status(400).json({error:"追加するタイプを1つ以上選択してください。"});
+    } else data.effectAddTypes = [];
+    if(data.effects.includes("inflict_status") && !["burn","paralysis","poison","toxic","sleep","freeze"].includes(data.status||"")) {
+      return res.status(400).json({error:"付与する状態異常を選択してください。"});
+    }
+  }
+  if(kind === "ability" || kind === "item") {
+    data.effectTypes = Array.isArray(data.effectTypes) ? data.effectTypes.filter(t=>ALL_TYPES.includes(t)) : [];
+    data.immuneTypes = Array.isArray(data.immuneTypes) ? data.immuneTypes.filter(t=>ALL_TYPES.includes(t)) : [];
+    data.choiceStats = Array.isArray(data.choiceStats) ? data.choiceStats.filter(t=>STAT_NAMES[t]) : [];
+    const abilityAllowed=["power_1_2","power_1_3_recoil","power_1_5_under_60","full_hp_survive","change_move_type","stat_boost","stat_drop","set_weather","set_field","weather_extend","field_extend","wall_extend","field_seed","contact_power_1_3","status_immune","first_move_type","entry_attack_drop","survive_once_1_8","speed_2x_item_lost","choice_1_5_lock","type_immune","full_hp_damage_half","end_turn_speed_up","contact_revenge","status_priority_plus_1","no_miss_both","faint_ally_power_1_1","half_hp_heal_quarter","mega_stone","contact_damage_half","no_burn","contact_revenge_item","no_paralysis","no_intimidate","received_type_stat_boost"];
+    data.effects=Array.isArray(data.effects)?[...new Set(data.effects.filter(e=>abilityAllowed.includes(e)))]: (data.effect&&abilityAllowed.includes(data.effect)?[data.effect]:[]);
+    data.effect=data.effects[0]||null;
+    if(data.effects.includes("choice_1_5_lock") && !data.choiceStats.length) return res.status(400).json({error:"こだわり状態で1.5倍にする能力を1つ以上選択してください。"});
+    if(data.effects.includes("change_move_type") && !ALL_TYPES.includes(data.effectMoveType)) return res.status(400).json({error:"技の変更タイプが不正です。"});
+    if(data.effects.includes("stat_boost") || data.effects.includes("stat_drop")) {
+      if(!STAT_NAMES[data.effectStat]) return res.status(400).json({error:"能力変化の対象能力が不正です。"});
+      data.effectStages = clamp(Number(data.effectStages ?? 1),1,3);
+      data.effectTarget = data.effectTarget === "opponent" ? "opponent" : "self";
+    } else { data.effectStat=null; data.effectStages=null; data.effectTarget=null; }
+    if(data.effects.includes("received_type_stat_boost")) {
+      if(!ALL_TYPES.includes(data.receivedMoveType)) return res.status(400).json({error:"受ける技のタイプが不正です。"});
+      if(!STAT_NAMES[data.receivedStat] || data.receivedStat === "hp") return res.status(400).json({error:"上昇させる能力が不正です。"});
+      data.receivedStages = clamp(Number(data.receivedStages ?? 1),1,3);
+      data.receivedMoveType = String(data.receivedMoveType);
+    } else { data.receivedMoveType=null; data.receivedStat=null; data.receivedStages=null; }
+    if(data.effects.includes("set_weather") && !Object.keys(WEATHER_NAMES).includes(data.weather)) return res.status(400).json({error:"発動する天候が不正です。"});
+    if(data.effects.includes("set_field") && !Object.keys(FIELD_NAMES).includes(data.field)) return res.status(400).json({error:"発動するフィールドが不正です。"});
+    if(data.effects.includes("set_weather")) data.weatherDuration=clamp(Number(data.weatherDuration??5),1,8);
+    if(data.effects.includes("set_field")) data.fieldDuration=clamp(Number(data.fieldDuration??5),1,8);
+    if(data.effects.includes("weather_extend") && !Object.keys(WEATHER_NAMES).includes(data.effectWeather)) return res.status(400).json({error:"延長する天候が不正です。"});
+    if(data.effects.includes("field_extend") && !Object.keys(FIELD_NAMES).includes(data.effectField)) return res.status(400).json({error:"延長するフィールドが不正です。"});
+    if(data.effects.includes("wall_extend") && !Object.keys(WALL_NAMES).includes(data.effectWall)) return res.status(400).json({error:"延長する壁が不正です。"});
+    if(data.effects.includes("field_seed")) {
+      if(!Object.keys(FIELD_NAMES).includes(data.seedField)) return res.status(400).json({error:"発動フィールドが不正です。"});
+      if(!STAT_NAMES[data.effectStat]) return res.status(400).json({error:"シードの能力が不正です。"});
+      data.effectStages = clamp(Number(data.effectStages ?? 1),1,3);
+      data.consume = data.consume !== false;
+    } else if(!data.effects.some(e=>["stat_boost","stat_drop"].includes(e))) {
+      data.consume = data.consume !== false;
+    }
+  }
+  if(kind === "move") {
+    const moveEffects=["","protect","recover","swords_dance","nasty_plot","dragon_dance","stat_boost","stat_drop","flinch","inflict_status","change_opponent_type","attack_then_switch","set_weather","set_field","light_screen","reflect","aurora_veil","stealth_rock","spikes","wall_break","grassy_power_half","remove_item","item_power_1_5"];
+    data.effects = (Array.isArray(data.effects) ? data.effects : [data.effect]).filter(e=>moveEffects.includes(e));
+    data.ineffectiveTypes = Array.isArray(data.ineffectiveTypes) ? data.ineffectiveTypes.filter(t=>ALL_TYPES.includes(t)) : [];
+    data.target = ["field","self","opponent"].includes(data.target) ? data.target : "opponent";
+    data.effect = data.effects[0] || null;
+    if(data.effects.includes("set_weather") && !Object.keys(WEATHER_NAMES).includes(data.weather)) return res.status(400).json({error:"天候が不正です。"});
+    if(data.effects.includes("set_field") && !Object.keys(FIELD_NAMES).includes(data.field)) return res.status(400).json({error:"フィールドが不正です。"});
+    if(data.effects.some(e=>["set_weather","set_field","light_screen","reflect","aurora_veil"].includes(e))) data.duration=clamp(Number(data.duration??5),1,8);
+  }
+  const id=memoryData.nextContentId++;
+  memoryData.content.push({id,kind,data,created_at:new Date().toISOString(),updated_at:new Date().toISOString()});
+  await saveData();
+  res.json({ id, kind, data });
+});
+app.delete("/api/content/:id", requireLogin, requireDeveloper, async (req, res) => {
+  const id=Number(req.params.id);
+  memoryData.content=memoryData.content.filter(r=>Number(r.id)!==id);
+  await saveData();
+  res.json({ ok: true });
+});
+
+/* Developer account management */
+app.get("/api/users", requireLogin, requireDeveloper, (req, res) => {
+  res.json(memoryData.users.slice().sort((a,b)=>b.id-a.id).map(({id,username,role,enabled,created_at})=>({id,username,role,enabled,created_at})));
+});
+app.post("/api/users", requireLogin, requireDeveloper, async (req, res) => {
+  const username = String(req.body?.username || "").trim();
+  const password = String(req.body?.password || "");
+  if (!/^[A-Za-z0-9_-]{3,32}$/.test(username)) {
+    return res.status(400).json({ error: "ユーザー名は3〜32文字の英数字・_・-で入力してください。" });
+  }
+  if (password.length < 1 || password.length > 128) {
+    return res.status(400).json({ error: "パスワードは1〜128文字で入力してください。" });
+  }
+  try {
+    if(memoryData.users.some(u=>u.username===username)) return res.status(409).json({ error:"そのユーザー名はすでに使われています。" });
+    const hash = bcrypt.hashSync(password, 12);
+    const created={id:memoryData.nextUserId++,username,password_hash:hash,role:"player",enabled:1,created_at:new Date().toISOString()};
+    memoryData.users.push(created);
+    await saveData();
+    res.status(201).json({id:created.id,username:created.username,role:created.role,enabled:created.enabled,created_at:created.created_at});
+  } catch (err) {
+    console.error("player account creation failed:", err);
+    res.status(500).json({ error: "アカウント作成に失敗しました。" });
+  }
+});
+app.patch("/api/users/:id", requireLogin, requireDeveloper, async (req, res) => {
+  const id = Number(req.params.id);
+  if (id === req.currentUser.id) return res.status(400).json({ error: "自分自身を無効化できません。" });
+  const enabled = req.body?.enabled ? 1 : 0;
+  const user=memoryData.users.find(u=>Number(u.id)===id && u.role==="player");
+  if(user) user.enabled=enabled;
+  await saveData();
+  res.json({ ok: true });
+});
+
+/* Server-side battle engine: type, stats, speed, abilities, items, move effects */
+const TYPE_CHART = {
+  ノーマル:{いわ:0.5,ゴースト:0,はがね:0.5},
+  ほのお:{くさ:2,こおり:2,むし:2,はがね:2,ほのお:0.5,みず:0.5,いわ:0.5,ドラゴン:0.5},
+  みず:{ほのお:2,じめん:2,いわ:2,みず:0.5,くさ:0.5,ドラゴン:0.5},
+  でんき:{みず:2,ひこう:2,じめん:0,でんき:0.5,くさ:0.5,ドラゴン:0.5},
+  くさ:{みず:2,じめん:2,いわ:2,ほのお:0.5,くさ:0.5,どく:0.5,ひこう:0.5,むし:0.5,ドラゴン:0.5,はがね:0.5},
+  こおり:{くさ:2,じめん:2,ひこう:2,ドラゴン:2,ほのお:0.5,みず:0.5,こおり:0.5,はがね:0.5},
+  かくとう:{ノーマル:2,こおり:2,いわ:2,あく:2,はがね:2,どく:0.5,ひこう:0.5,エスパー:0.5,むし:0.5,フェアリー:0.5,ゴースト:0},
+  どく:{くさ:2,フェアリー:2,どく:0.5,じめん:0.5,いわ:0.5,ゴースト:0.5,はがね:0},
+  じめん:{ほのお:2,でんき:2,どく:2,いわ:2,はがね:2,くさ:0.5,むし:0.5,ひこう:0},
+  ひこう:{くさ:2,かくとう:2,むし:2,でんき:0.5,いわ:0.5,はがね:0.5},
+  エスパー:{かくとう:2,どく:2,エスパー:0.5,はがね:0.5,あく:0},
+  むし:{くさ:2,エスパー:2,あく:2,ほのお:0.5,かくとう:0.5,どく:0.5,ひこう:0.5,ゴースト:0.5,はがね:0.5,フェアリー:0.5},
+  いわ:{ほのお:2,こおり:2,ひこう:2,むし:2,かくとう:0.5,じめん:0.5,はがね:0.5},
+  ゴースト:{エスパー:2,ゴースト:2,あく:0.5,ノーマル:0},
+  ドラゴン:{ドラゴン:2,はがね:0.5,フェアリー:0},
+  あく:{エスパー:2,ゴースト:2,かくとう:0.5,あく:0.5,フェアリー:0.5},
+  はがね:{こおり:2,いわ:2,フェアリー:2,ほのお:0.5,みず:0.5,でんき:0.5,はがね:0.5},
+  フェアリー:{かくとう:2,ドラゴン:2,あく:2,ほのお:0.5,どく:0.5,はがね:0.5}
+};
+const STATUS_NAMES = { burn:"やけど", paralysis:"まひ", poison:"どく", toxic:"もうどく", sleep:"ねむり", freeze:"こおり" };
+const ALL_TYPES = ["ノーマル","ほのお","みず","でんき","くさ","こおり","かくとう","どく","じめん","ひこう","エスパー","むし","いわ","ゴースト","ドラゴン","あく","はがね","フェアリー"];
+const STAT_NAMES = {attack:"攻撃",defense:"防御",spAttack:"特攻",spDefense:"特防",speed:"素早さ"};
+const DEFAULT_STATS = {hp:100, attack:70, defense:70, spAttack:70, spDefense:70, speed:70};
+const WEATHER_NAMES = {sun:"はれ", rain:"あめ", sand:"すなあらし", snow:"ゆき"};
+const FIELD_NAMES = {electric:"エレキフィールド", grassy:"グラスフィールド", misty:"ミストフィールド", psychic:"サイコフィールド"};
+const WALL_NAMES = {light_screen:"ひかりのかべ", reflect:"リフレクター", aurora_veil:"オーロラベール"};
+
+function clamp(n,min,max){return Math.max(min,Math.min(max,n));}
+function readKind(kind){return memoryData.content.filter(r=>r.kind===kind).sort((a,b)=>a.id-b.id).map(r=>({id:r.id,kind:r.kind,data:r.data}));}
+function getSpeciesByIds(ids){
+  const rows=readKind("species");
+  return ids.map(id=>rows.find(x=>String(x.data.id)===String(id))?.data).filter(Boolean);
+}
+function getSpeciesById(id){
+  const rows=readKind("species");
+  return rows.find(x=>String(x.data.id)===String(id))?.data || null;
+}
+function getMove(id){return readKind("move").find(x=>String(x.data.id)===String(id))?.data||null;}
+function getAbility(id){return readKind("ability").find(x=>String(x.data.id)===String(id))?.data||null;}
+function getItem(id){return readKind("item").find(x=>String(x.data.id)===String(id))?.data||null;}
+function getEnemyTeam(){
+  return readKind("enemy_team").map(x=>x.data).find(t=>Array.isArray(t.species)&&t.species.length>=3)||null;
+}
+function statValue(p,key){
+  const base=Number((p.stats||{})[key] ?? DEFAULT_STATS[key]);
+  const ev=Math.max(0,Math.min(32,Number((p.evs||{})[key] ?? 0)));
+  const raw=base+20+ev;
+  if(key==="hp") return base+ev+75;
+  const nature=p.personality&&typeof p.personality==="object"?p.personality:{};
+  if(nature.up===key) return Math.floor(raw*1.1);
+  if(nature.down===key) return Math.floor(raw*0.9);
+  return raw;
+}
+function personalityLabel(p){
+  const n=p.personality&&typeof p.personality==="object"?p.personality:{};
+  return {up:n.up||null,down:n.down||null};
+}
+function calculatedStats(p){
+  return {hp:statValue(p,"hp"),attack:statValue(p,"attack"),defense:statValue(p,"defense"),spAttack:statValue(p,"spAttack"),spDefense:statValue(p,"spDefense"),speed:statValue(p,"speed")};
+}
+function speciesTypes(p){return Array.isArray(p.type)?p.type:(p.types||[]);}
+function abilityIds(p){return (p.abilities||[]).map(String);}
+function itemId(p){return p.itemId || p.item || null;}
+function hasAbility(p,name){return abilityIds(p).includes(name) || p.ability===name;}
+function effectTypesMatch(data,moveType){const types=Array.isArray(data?.effectTypes)?data.effectTypes.filter(Boolean):[];return types.length===0 || types.includes(moveType);}
+function abilityEffects(ab){return [...new Set((Array.isArray(ab?.effects)&&ab.effects.length?ab.effects:[ab?.effect]).filter(Boolean))];}
+function effectiveMoveType(attacker,move){
+  let type=move.type||"ノーマル";
+  for(const aid of abilityIds(attacker)){
+    const ab=getAbility(aid);
+    if(abilityEffects(ab).includes("change_move_type") && effectTypesMatch(ab,type) && ALL_TYPES.includes(ab.effectMoveType)){
+      type=ab.effectMoveType;
+    }
+  }
+  return type;
+}
+function hasFullHpSurvival(p,moveType){
+  const item=itemWorks(p,moveType);
+  if(item?.effect==="full_hp_survive") return true;
+  return abilityIds(p).some(aid=>{const ab=getAbility(aid);return abilityEffects(ab).includes("full_hp_survive") && effectTypesMatch(ab,moveType);});
+}
+function abilityWorks(p,name,moveType){if(!hasAbility(p,name))return false;const id=abilityIds(p).find(x=>String(x)===String(name)) || (p.ability===name?name:null);return effectTypesMatch(getAbility(id),moveType);}
+function itemWorks(p,moveType){const id=itemId(p);if(!id)return null;const item=getItem(id);if(!item)return null;return effectTypesMatch(item,moveType)?item:null;}
+function effectRoll(move){return Math.random()*100 < clamp(Number(move.effectChance ?? 100),0,100);}
+function moveEffectsOf(move){const a=Array.isArray(move?.effects)&&move.effects.length?move.effects:[move?.effect];return [...new Set(a.filter(Boolean))];}
+function moveHasEffect(move,e){return moveEffectsOf(move).includes(e);}
+function abilityHasEffect(p,e){return abilityIds(p).some(aid=>abilityEffects(getAbility(aid)).includes(e));}
+function abilityHasEffectForMove(p,e,moveType){return abilityIds(p).some(aid=>{const ab=getAbility(aid);return abilityEffects(ab).includes(e) && effectTypesMatch(ab,moveType);});}
+function abilityTypeImmune(p,moveType){return abilityIds(p).some(aid=>{const ab=getAbility(aid);return abilityEffects(ab).includes("type_immune") && Array.isArray(ab.immuneTypes) && ab.immuneTypes.includes(moveType);});}
+function effectiveSpeed(side,p){
+  let v=statValue(p,"speed");
+  const status=side.status[side.active]||{};
+  if(status.paralysis)v=Math.floor(v/2);
+  if(hasAbility(p,"swift_swim") && side.weather==="rain")v*=2;
+  if(hasAbility(p,"chlorophyll") && side.weather==="sun")v*=2;
+  if(hasAbility(p,"slow_start") && side.slowStart[side.active])v=Math.floor(v/2);
+  const item=getItem(itemId(p));
+  if(item?.effect==="choice_scarf")v=Math.floor(v*1.5);
+  if((item?.effect==="choice_1_5_lock" && (Array.isArray(item.choiceStats)?item.choiceStats:["attack","defense","spAttack","spDefense","speed"]).includes("speed")) || item?.effect==="choice_speed_1_5")v=Math.floor(v*1.5);
+  if(side.itemLost[side.active])v*=2;
+  return v;
+}
+function typeEffectiveness(moveType,target){
+  let mult=1;
+  for(const t of speciesTypes(target)) mult*=TYPE_CHART[moveType]?.[t] ?? 1;
+  return mult;
+}
+function initSide(team,selected){
+  if(!Array.isArray(team)||!team.length)throw new Error("パーティが空です。");
+  if(!Array.isArray(selected)||!selected.length||selected.some(i=>!Number.isInteger(i)||i<0||i>=team.length))throw new Error("選出ポケモンの番号が不正です。");
+  return {team,selected,active:selected[0],hp:team.map(p=>statValue(p,"hp")),maxHp:team.map(p=>statValue(p,"hp")),
+    status:team.map(()=>null),statusTurns:team.map(()=>0),boosts:team.map(()=>({attack:0,defense:0,spAttack:0,spDefense:0,speed:0})),
+    protected:team.map(()=>false),hazards:{stealth_rock:false,spikes:0},slowStart:team.map(p=>hasAbility(p||{},"slow_start")),weather:null,weatherTurns:0,field:null,fieldTurns:0,walls:{light_screen:0,reflect:0,aurora_veil:0},
+    volatile:team.map(()=>({})),choiceMove:team.map(()=>null),itemLost:team.map(()=>false),itemTriggered:team.map(()=>false),megaUsed:false};
+}
+function publicPokemon(side,i){
+  const p=side.team[i], st=side.status[i];
+  return {name:p.name,hp:side.hp[i],maxHp:side.maxHp[i],selected:side.selected.includes(i),active:i===side.active,
+    fainted:side.hp[i]<=0,status:st?STATUS_NAMES[st]:null,type:speciesTypes(p),item:itemId(p)?getItem(itemId(p))?.name:null,
+    abilities:abilityIds(p),moves:Array.isArray(p.moves)?p.moves.map(String).filter(id=>getMove(id)):[],stats:calculatedStats(p),personality:personalityLabel(p),mega:!!p._mega,megaAvailable:!!p.mega?.enabled&&!side.megaUsed,choiceMove:side.choiceMove[i]?String(side.choiceMove[i]):null,itemLost:!!side.itemLost[i]};
+}
+function publicBattle(b){
+  return {id:b.id,turn:b.turn,phase:b.phase,over:b.over,result:b.result,
+    weather:b.weather||null,weatherTurns:b.weatherTurns||0,field:b.field||null,fieldTurns:b.fieldTurns||0,playerWalls:b.player.walls,enemyWalls:b.enemy.walls,playerHazards:b.player.hazards,enemyHazards:b.enemy.hazards,
+    player:{team:b.player.team.map((_,i)=>publicPokemon(b.player,i)),active:b.player.active},
+    enemy:{team:b.enemy.team.map((_,i)=>publicPokemon(b.enemy,i)),active:b.enemy.active},
+    log:b.log.slice(-100)};
+}
+function makeBattle(playerIds){
+  const playerTeam=getSpeciesByIds(playerIds);
+  if(playerTeam.length!==6)throw new Error("6匹の登録済みポケモンが必要です。");
+  const enemyData=getEnemyTeam(); if(!enemyData)throw new Error("開発者が相手パーティを登録していません。");
+  if(!Array.isArray(enemyData.species)||enemyData.species.length<3)throw new Error("相手パーティは3匹以上必要です。");
+  const enemyTeam=enemyData.species.slice(0,6).map(id=>getSpeciesById(id));
+  if(enemyTeam.some(p=>!p))throw new Error("相手パーティに未登録のポケモンがあります。相手パーティを登録し直してください。");
+  let enemySelected=Array.isArray(enemyData.selected)?enemyData.selected.map(Number).filter(Number.isInteger):[0,1,2];
+  enemySelected=[...new Set(enemySelected)].filter(i=>i>=0&&i<enemyTeam.length).slice(0,3);
+  while(enemySelected.length<3){const next=enemyTeam.findIndex((_,i)=>!enemySelected.includes(i));if(next<0)break;enemySelected.push(next);}
+  if(enemySelected.length!==3)throw new Error("相手パーティの選出が不正です。相手パーティを登録し直してください。");
+  const b={id:crypto.randomUUID(),turn:1,phase:"selection",over:false,result:null,weather:null,
+    player:initSide(playerTeam,[]),enemy:initSide(enemyTeam,enemySelected),log:["対戦開始。6匹から3匹を選出してください。"]};
+  return b;
+}
+function boostMultiplier(stage){return stage>=0?(2+stage)/2:2/(2-stage);}
+function statWithBoost(side,i,key){
+  const p=side.team[i];
+  const choice=getItem(itemId(p));
+  const choiceStats=choice?.effect==="choice_1_5_lock" ? (Array.isArray(choice.choiceStats)?choice.choiceStats:["attack","defense","spAttack","spDefense","speed"]) : (choice?.effect==="choice_attack_1_5"?["attack"]:choice?.effect==="choice_spAttack_1_5"?["spAttack"]:choice?.effect==="choice_speed_1_5"?["speed"]:[]);
+  const base=statValue(p,key)*(choiceStats.includes(key)?1.5:1);
+  return Math.max(1,Math.floor(base*boostMultiplier(side.boosts[i][key]||0)));
+}
+function addBoost(b,side,i,key,amount){
+  side.boosts[i][key]=clamp((side.boosts[i][key]||0)+amount,-6,6);
+  const n=side.boosts[i][key];
+  b.log.push(`${side.team[i].name}の${key}が${amount>0?"上がった":"下がった"}（ランク${n}）。`);
+}
+function setStatus(b,side,i,status,fromStatusMove=false){
+  if(side.status[i]||side.hp[i]<=0)return false;
+  const p=side.team[i];
+  if(fromStatusMove && hasAbility(p,"status_immune")) { b.log.push(`${p.name}は相手の変化技を受けない！`); return false; }
+  if(status==="burn" && abilityHasEffect(p,"no_burn")){b.log.push(`${p.name}の特性でやけどにならない！`);return false;}
+  if(status==="paralysis" && abilityHasEffect(p,"no_paralysis")){b.log.push(`${p.name}の特性でまひにならない！`);return false;}
+  if(status==="poison" && speciesTypes(side.team[i]).includes("どく"))return false;
+  if(status==="toxic" && (speciesTypes(side.team[i]).includes("どく")||speciesTypes(side.team[i]).includes("はがね")))return false;
+  if(status==="paralysis" && speciesTypes(side.team[i]).includes("でんき"))return false;
+  side.status[i]=status;side.statusTurns[i]=0;
+  b.log.push(`${side.team[i].name}は${STATUS_NAMES[status]}になった！`);
+  return true;
+}
+function canAct(b,side,i){
+  const st=side.status[i];
+  if(st==="sleep"){side.statusTurns[i]++; if(side.statusTurns[i]>=2){side.status[i]=null;b.log.push(`${side.team[i].name}は目を覚ました！`);return true} b.log.push(`${side.team[i].name}は眠っていて動けない！`);return false;}
+  if(st==="freeze"){if(Math.random()<0.2){side.status[i]=null;b.log.push(`${side.team[i].name}のこおりがとけた！`);return true}b.log.push(`${side.team[i].name}はこおって動けない！`);return false;}
+  if(st==="paralysis"&&Math.random()<0.25){b.log.push(`${side.team[i].name}はまひして動けない！`);return false;}
+  return true;
+}
+function endTurnSide(b,side){
+  const i=side.active,p=side.team[i],st=side.status[i];
+  if(side.hp[i]<=0)return;
+  if(side.volatile[i]?.enteredThisTurn){ delete side.volatile[i].enteredThisTurn; } else if(abilityHasEffect(p,"end_turn_speed_up")){ addBoost(b,side,i,"speed",1); b.log.push(`${p.name}の特性で素早さが1段階上がった！`); }
+  if(st==="burn"){const d=Math.max(1,Math.floor(side.maxHp[i]/16));side.hp[i]=Math.max(0,side.hp[i]-d);b.log.push(`${p.name}はやけどで${d}ダメージ。`);}
+  if(st==="poison"){const d=Math.max(1,Math.floor(side.maxHp[i]/8));side.hp[i]=Math.max(0,side.hp[i]-d);b.log.push(`${p.name}はどくで${d}ダメージ。`);}
+  if(side.hp[i]>0) triggerHalfHpHeal(b,side,i);
+  if(st==="toxic"){side.statusTurns[i]++;const d=Math.max(1,Math.floor(side.maxHp[i]*side.statusTurns[i]/16));side.hp[i]=Math.max(0,side.hp[i]-d);b.log.push(`${p.name}はもうどくで${d}ダメージ。`);}
+  const item=getItem(itemId(p));
+  if(item?.effect==="leftovers"&&side.hp[i]>0){const heal=Math.max(1,Math.floor(side.maxHp[i]/16));side.hp[i]=Math.min(side.maxHp[i],side.hp[i]+heal);b.log.push(`${p.name}はたべのこしで${heal}回復。`);}
+  if(b.field==="grassy"&&side.hp[i]>0){const heal=Math.max(1,Math.floor(side.maxHp[i]/16));side.hp[i]=Math.min(side.maxHp[i],side.hp[i]+heal);b.log.push(`${p.name}はグラスフィールドで${heal}回復。`);}
+}
+function applyHazards(b,side,i){
+  const p=side.team[i];
+  const h=side===b.player?b.enemy.hazards:b.player.hazards;
+  if(h.stealth_rock) {
+    const mult=typeEffectiveness("いわ",p);
+    const d=Math.max(1,Math.floor(side.maxHp[i]/8*mult));
+    side.hp[i]=Math.max(0,side.hp[i]-d);
+    b.log.push(`${p.name}はステルスロックで${d}ダメージを受けた！`);
+  }
+  if(h.spikes>0 && !speciesTypes(p).includes("ひこう")) {
+    const ratio=h.spikes===1?1/8:h.spikes===2?1/6:1/4;
+    const d=Math.max(1,Math.floor(side.maxHp[i]*ratio));
+    side.hp[i]=Math.max(0,side.hp[i]-d);
+    b.log.push(`${p.name}はまきびしで${d}ダメージを受けた！`);
+  }
+}
+function setHazard(b,side,effect){
+  if(effect==="stealth_rock") {
+    if(side.hazards.stealth_rock){b.log.push("ステルスロックはすでに撒かれている！");return;}
+    side.hazards.stealth_rock=true; b.log.push("ステルスロックを撒いた！");
+  } else if(effect==="spikes") {
+    if(side.hazards.spikes>=3){b.log.push("まきびしはこれ以上撒けない！");return;}
+    side.hazards.spikes++; b.log.push(`まきびしを撒いた！（${side.hazards.spikes}段階）`);
+  }
+}
+function applyEntryEffects(b,side,i){
+  const p=side.team[i];
+  const effects=[];
+  for(const aid of abilityIds(p)){
+    const ab=getAbility(aid);
+    if(abilityEffects(ab).includes("stat_boost")||abilityEffects(ab).includes("stat_drop")) effects.push({source:"特性",data:ab});
+  }
+  const item=getItem(itemId(p));
+  if(item?.effect==="stat_boost"||item?.effect==="stat_drop") effects.push({source:"持ち物",data:item});
+  for(const {source,data} of effects){
+    const amount=(data.effect==="stat_drop"?-1:1)*clamp(Number(data.effectStages||1),1,3);
+    const target=data.effectTarget==="opponent"?(side===b.player?b.enemy:b.player):side;
+    const ti=target.active;
+    if(target.hp[ti]>0 && STAT_NAMES[data.effectStat]) addBoost(b,target,ti,data.effectStat,amount);
+    b.log.push(`${p.name}の${source}「${data.name||""}」の能力変化が発動した！`);
+  }
+  // 場に出た時の追加特性
+  for(const aid of abilityIds(p)){
+    const ab=getAbility(aid);
+    if(!ab) continue;
+    if(abilityEffects(ab).includes("entry_attack_drop")) {
+      const other=side===b.player?b.enemy:b.player, oi=other.active;
+      if(other.hp[oi]>0) addBoost(b,other,oi,"attack",-1);
+      b.log.push(`${p.name}の特性「${ab.name||aid}」で相手の攻撃が下がった！`);
+    }
+  }
+  applyHazards(b,side,i);
+
+  // 特性による天候・フィールド展開は、その特性を持つポケモンが場に出た時に発動。
+  for(const aid of abilityIds(p)){
+    const ab=getAbility(aid);
+    if(!ab) continue;
+    if(abilityEffects(ab).includes("set_weather") && WEATHER_NAMES[ab.weather]){
+      setWeather(b,ab.weather,Number(ab.weatherDuration||5),side);
+      b.log.push(`${p.name}の特性「${ab.name||aid}」で天候が変化した！`);
+    }
+    if(abilityEffects(ab).includes("set_field") && FIELD_NAMES[ab.field]){
+      setField(b,ab.field,Number(ab.fieldDuration||5),side);
+      b.log.push(`${p.name}の特性「${ab.name||aid}」でフィールドが展開された！`);
+    }
+  }
+}
+function extendDuration(side,key,amount){side[key]=Math.max(0,Number(side[key]||0)+amount);}
+function setWeather(b,weather,duration=5,sourceSide=null){
+  let d=duration;
+  if(sourceSide){const item=getItem(itemId(sourceSide.team[sourceSide.active]));if(item?.effect==="weather_extend"&&item.effectWeather===weather)d+=5;}
+  b.weather=weather;b.weatherTurns=d;b.log.push(`天候が${WEATHER_NAMES[weather]||weather}になった！（${d}ターン）`);
+}
+function setField(b,field,duration=5,sourceSide=null){
+  let d=duration;
+  if(sourceSide){const item=getItem(itemId(sourceSide.team[sourceSide.active]));if(item?.effect==="field_extend"&&item.effectField===field)d+=5;}
+  b.field=field;b.fieldTurns=d;b.log.push(`フィールドが${FIELD_NAMES[field]||field}になった！（${d}ターン）`);
+  applyFieldSeedsAll(b);
+}
+function setWall(b,side,wall,duration=5){let d=duration;const item=getItem(itemId(side.team[side.active]));if(item?.effect==="wall_extend" && item.effectWall===wall)d+=5;side.walls[wall]=Math.max(side.walls[wall]||0,d);b.log.push(`${WALL_NAMES[wall]||wall}を張った！（${side.walls[wall]}ターン）`);}
+function consumeItem(side,i,b,reason){const p=side.team[i],item=getItem(itemId(p));if(!item||item.consume===false)return false;const id=itemId(p);p.itemId=null;p.item=null;side.itemLost[i]=true;b.log.push(`${p.name}の${item.name||id}は${reason}で消費された！`);if(getAbility(p,"speed_2x_item_lost"))b.log.push(`${p.name}は持ち物を失い、素早さが2倍になった！`);return true;}
+function applyFieldSeed(b,side,i){const p=side.team[i],item=getItem(itemId(p));if(!item||item.effect!=="field_seed"||b.field!==item.seedField)return;addBoost(b,side,i,item.effectStat,clamp(Number(item.effectStages||1),1,3));b.log.push(`${p.name}の${item.name||"フィールドシード"}が発動した！`);if(item.consume!==false)consumeItem(side,i,b,"フィールド条件");}
+function applyFieldSeedsAll(b){for(const side of [b.player,b.enemy]){const i=side.active;if(side.hp[i]>0)applyFieldSeed(b,side,i);}}
+function triggerHalfHpHeal(b,side,i){
+  if(side.hp[i]<=0 || side.itemTriggered[i]) return;
+  const p=side.team[i], item=getItem(itemId(p));
+  if(!item || item.effect!=="half_hp_heal_quarter") return;
+  if(side.hp[i]>side.maxHp[i]/2) return;
+  const heal=Math.max(1,Math.floor(side.maxHp[i]/4));
+  const before=side.hp[i];
+  side.hp[i]=Math.min(side.maxHp[i],side.hp[i]+heal);
+  side.itemTriggered[i]=true;
+  b.log.push(`${p.name}の${item.name||"持ち物"}が発動し、HPを${side.hp[i]-before}回復した！`);
+  if(item.consume!==false) consumeItem(side,i,b,"HP半分以下になった時の回復");
+}
+function applySwitchIn(b,side){
+  const i=side.active,p=side.team[i];
+  side.choiceMove[i]=null;
+  side.itemLost[i]=false;
+  side.itemTriggered[i]=false;
+  side.volatile[i]={enteredThisTurn:true};
+  applyEntryEffects(b,side,i);
+  if(hasAbility(p,"intimidate")){
+    const other=side===b.player?b.enemy:b.player, oi=other.active;
+    if(other.hp[oi]>0){
+      if(abilityHasEffect(other.team[oi],"no_intimidate")){
+        b.log.push(`${other.team[oi].name}の特性でいかくの効果を受けない！`);
+      }else{
+        addBoost(b,other,oi,"attack",-1);
+        b.log.push(`${p.name}のいかく！`);
+      }
+    }
+  }
+  if(hasAbility(p,"drizzle")){setWeather(b,"rain",5,side);}
+  if(hasAbility(p,"drought")){setWeather(b,"sun",5,side);}
+  applyFieldSeed(b,side,i);
+}
+function calcDamage(b,attSide,defSide,move){
+  const ai=attSide.active,di=defSide.active,a=attSide.team[ai],d=defSide.team[di];
+  const moveType=effectiveMoveType(a,move);
+  const category=move.category||"physical";
+  const atk=statWithBoost(attSide,ai,category==="special"?"spAttack":"attack");
+  const def=statWithBoost(defSide,di,category==="special"?"spDefense":"defense");
+  let base=Math.floor(Math.floor((2*50/5+2)*Number(move.power||0)*atk/Math.max(1,def))/50)+2;
+  // やけど中は物理技のダメージを半減する
+  if(category==="physical" && attSide.status[ai]==="burn") base=Math.floor(base/2);
+  if(move.contact && abilityHasEffectForMove(d,"contact_damage_half",moveType)){ base=Math.floor(base/2); b.log.push(`${d.name}の特性で接触技の威力が半減した！`); }
+  if(attSide.hp[ai]===attSide.maxHp[ai] && abilityHasEffect(d,"full_hp_damage_half")) base=Math.floor(base/2);
+  let mult=typeEffectiveness(moveType,d);
+  if(Array.isArray(move.ineffectiveTypes) && move.ineffectiveTypes.some(t=>speciesTypes(d).includes(t))) mult=0;
+  if(abilityTypeImmune(d,moveType)) mult=0;
+  if(mult===0)return {damage:0,mult,stab:1};
+  const stab=speciesTypes(a).includes(moveType)?1.5:1;
+  const weather=(b.weather==="rain"&&moveType==="みず")?1.5:(b.weather==="rain"&&moveType==="ほのお")?.5:(b.weather==="sun"&&moveType==="ほのお")?1.5:(b.weather==="sun"&&moveType==="みず")?.5:(b.weather==="sand"&&["いわ","じめん","はがね"].includes(moveType))?1.1:(b.weather==="snow"&&moveType==="こおり")?1.5:1;
+  let terrain=(b.field==="electric"&&moveType==="でんき")?1.3:(b.field==="grassy"&&moveType==="くさ")?1.3:(b.field==="psychic"&&moveType==="エスパー")?1.3:(b.field==="misty"&&moveType==="ドラゴン")?.5:1;
+  if(b.field==="grassy" && moveHasEffect(move,"grassy_power_half")) terrain*=0.5;
+  let itemMult=1;const item=itemWorks(a,moveType);
+  if(move.contact && abilityHasEffect(a,"contact_power_1_3")) itemMult*=1.3;
+  const defenderHeldItem = !!itemId(d);
+  if(moveHasEffect(move,"item_power_1_5") && defenderHeldItem) itemMult*=1.5;
+  if(item?.effect==="life_orb")itemMult*=1.3;
+  if(item?.effect==="power_1_2")itemMult*=1.2;
+  if(item?.effect==="power_1_3_recoil")itemMult*=1.3;
+  for(const aid of abilityIds(a)){
+    const ab=getAbility(aid); if(!ab || !effectTypesMatch(ab,move.type)) continue;
+    if(abilityEffects(ab).includes("power_1_2")){itemMult*=1.2;b.log.push(`${a.name}の特性「${ab.name||aid}」で技の威力が1.2倍になった！`);} 
+    if(abilityEffects(ab).includes("power_1_3_recoil")){itemMult*=1.3;b.log.push(`${a.name}の特性「${ab.name||aid}」で技の威力が1.3倍になった！`);} 
+  }
+  if(abilityWorks(a,"blaze",moveType)&&moveType==="ほのお"&&attSide.hp[ai]<=attSide.maxHp[ai]/3)mult*=1.5;
+  if(abilityWorks(a,"torrent",moveType)&&moveType==="みず"&&attSide.hp[ai]<=attSide.maxHp[ai]/3)mult*=1.5;
+  if(abilityWorks(a,"huge_power",moveType)&&category==="physical")base*=2;
+  if(base < 0) base=0;
+  for(const aid of abilityIds(a)){
+    const ab=getAbility(aid);
+    if(abilityEffects(ab).includes("power_1_5_under_60") && effectTypesMatch(ab,moveType) && Number(move.power||0)<60){itemMult*=1.5;b.log.push(`${a.name}の特性「${ab.name||aid}」で威力60未満の技が1.5倍になった！`);}
+    if(abilityEffects(ab).includes("faint_ally_power_1_1")){
+      const fainted=attSide.selected.filter(x=>x!==ai && attSide.hp[x]<=0).length;
+      if(fainted>0){itemMult*=1+(0.1*fainted);b.log.push(`${a.name}の特性で瀕死の味方${fainted}匹分、技の威力が上がった！`);}
+    }
+  }
+  const crit=Math.random()<0.0625?1.5:1;
+  const random=0.85+Math.random()*0.15;
+    let wall=1;
+  if(!moveHasEffect(move,"wall_break")){
+    if(category==="physical" && (defSide.walls.reflect>0 || defSide.walls.aurora_veil>0)) wall*=0.5;
+    if(category==="special" && (defSide.walls.light_screen>0 || defSide.walls.aurora_veil>0)) wall*=0.5;
+  }
+  return {damage:Math.max(1,Math.floor(base*stab*mult*weather*terrain*itemMult*wall*crit*random)),mult,stab,crit,moveType};
+}
+function triggerReceivedTypeStatBoost(b,attSide,defSide,move,di){
+  const moveType=effectiveMoveType(attSide.team[attSide.active],move);
+  const target=defSide.team[di];
+  if(!target || defSide.hp[di]<=0) return;
+  for(const aid of abilityIds(target)){
+    const ab=getAbility(aid);
+    if(!ab || !abilityEffects(ab).includes("received_type_stat_boost")) continue;
+    if(ab.receivedMoveType !== moveType) continue;
+    const stat=STAT_NAMES[ab.receivedStat] && ab.receivedStat !== "hp" ? ab.receivedStat : null;
+    if(!stat) continue;
+    const stages=clamp(Number(ab.receivedStages||1),1,3);
+    addBoost(b,defSide,di,stat,stages);
+    b.log.push(`${target.name}の特性「${ab.name||aid}」で${moveType}タイプの技を受け、${STAT_NAMES[stat]}が${stages}段階上がった！`);
+  }
+}
+function doMove(b,attSide,defSide,move){
+  const ai=attSide.active;
+  const target=move.target||"opponent";
+  const targetSide=target==="self"?attSide:(target==="field"?null:defSide);
+  const di=targetSide?targetSide.active:null;
+  const a=attSide.team[ai],d=targetSide?targetSide.team[di]:null;
+  const effects=moveEffectsOf(move);
+  if(!canAct(b,attSide,ai))return {switched:false};
+  const choice=getItem(itemId(a));
+  if(["choice_1_5_lock","choice_attack_1_5","choice_spAttack_1_5","choice_speed_1_5"].includes(choice?.effect)) {
+    if(attSide.choiceMove[ai] && String(attSide.choiceMove[ai])!==String(move.id)) throw new Error(`${a.name}はこだわり状態で${getMove(attSide.choiceMove[ai])?.name||"その技"}しか使えません。`);
+    if(!attSide.choiceMove[ai]) { attSide.choiceMove[ai]=String(move.id); b.log.push(`${a.name}は${move.name}にこだわった！`); }
+  }
+  if(targetSide && move.category==="status" && hasAbility(d,"status_immune")){b.log.push(`${d.name}は相手の変化技を受けない！`);return {switched:false};}
+
+  // 場に出てから最初に選んだ技のタイプを自分のタイプにする。
+  if(abilityHasEffect(a,"first_move_type") && !attSide.volatile[ai]?.firstMoveTypeDone){
+    const firstType=effectiveMoveType(a,move); a.type=[firstType]; attSide.volatile[ai].firstMoveTypeDone=true;
+    b.log.push(`${a.name}は${firstType}タイプになった！`);
+  }
+  const moveType=effectiveMoveType(a,move);
+  const chance=()=>effectRoll(move);
+  let switched=false;
+
+  // 複数効果を順番に処理する。攻撃技にも変化効果を併設できる。
+  if(effects.includes("stealth_rock") && chance()) setHazard(b,attSide,"stealth_rock");
+  if(effects.includes("spikes") && chance()) setHazard(b,attSide,"spikes");
+  if(effects.includes("set_weather") && chance()) setWeather(b,move.weather,Number(move.duration||5),attSide);
+  if(effects.includes("set_field") && chance()) setField(b,move.field,Number(move.fieldDuration||move.duration||5),attSide);
+  for(const wall of ["light_screen","reflect","aurora_veil"]){if(effects.includes(wall)&&chance()) setWall(b,attSide,wall,Number(move.duration||5));}
+  if(effects.includes("protect") && chance()){attSide.protected[ai]=true;b.log.push(`${a.name}はまもるを使った！`);}
+  if(effects.includes("recover") && chance()){const heal=Math.max(1,Math.floor(attSide.maxHp[ai]/2));attSide.hp[ai]=Math.min(attSide.maxHp[ai],attSide.hp[ai]+heal);b.log.push(`${a.name}は${heal}回復した！`);}
+  if(target==="field"){
+    if(effects.includes("stealth_rock")||effects.includes("spikes")||effects.some(e=>["set_weather","set_field","light_screen","reflect","aurora_veil"].includes(e))) return {switched:false};
+    return {switched:false};
+  }
+  if(effects.includes("swords_dance") && chance()) addBoost(b,attSide,ai,"attack",2);
+  if(effects.includes("nasty_plot") && chance()) addBoost(b,attSide,ai,"spAttack",2);
+  if(effects.includes("dragon_dance") && chance()){addBoost(b,attSide,ai,"attack",1);addBoost(b,attSide,ai,"speed",1);}
+  if((effects.includes("stat_boost")||effects.includes("stat_drop")) && chance()){
+    const key=STAT_NAMES[move.effectStat]?move.effectStat:null;
+    const amount=(effects.includes("stat_drop")&&!effects.includes("stat_boost")?-1:1)*clamp(Number(move.effectStages||1),1,3);
+    if(key){const target=move.effectTarget==="opponent"?defSide:attSide;const ti=move.effectTarget==="opponent"?di:ai;addBoost(b,target,ti,key,amount);}
+  }
+
+  const power=Number(move.power||0);
+  if(power<=0){
+    if(effects.includes("remove_item") && d.hp[di]>0 && chance() && itemId(d)){const oldItem=getItem(itemId(d));d.itemId=null;d.item=null;defSide.itemLost[di]=true;b.log.push(`${d.name}の持ち物「${oldItem?.name||""}」がなくなった！`);}
+    if(effects.includes("change_opponent_type") && d.hp[di]>0 && chance()){const types=Array.isArray(move.effectAddTypes)?move.effectAddTypes.filter(t=>ALL_TYPES.includes(t)):[move.effectAddType].filter(t=>ALL_TYPES.includes(t));d.type=types;b.log.push(`${d.name}のタイプが${types.length?types.join("・"):"なし"}になった！`);}
+    if((move.status||effects.includes("inflict_status")) && d.hp[di]>0 && chance() && move.status) setStatus(b,defSide,di,move.status,move.category==="status");
+    if(effects.includes("flinch") && d.hp[di]>0 && chance()){defSide.volatile[di].flinch=true;b.log.push(`${d.name}はひるみそうだ！`);}
+    return {switched:false};
+  }
+
+  const noMiss=abilityHasEffect(a,"no_miss_both") || abilityHasEffect(d,"no_miss_both");
+  const acc=Number(move.accuracy??100);if(!noMiss && acc<100&&Math.random()*100>=acc){b.log.push(`${a.name}の${move.name}は外れた！`);return {switched:false};}
+  if(defSide.protected[di]){b.log.push(`${d.name}はまもっている！`);return {switched:false};}
+  const preview=calcDamage(b,attSide,defSide,move);
+  if(preview.mult!==0) triggerReceivedTypeStatBoost(b,attSide,defSide,move,di);
+  const r=preview;
+  if(r.mult===0){b.log.push(`${a.name}の${move.name}！ しかし効果がない！`);return {switched:false};}
+  let damage=r.damage, survivedByAbility=false;
+  for(const aid of abilityIds(d)){
+    const ab=getAbility(aid);
+    if(abilityEffects(ab).includes("survive_once_1_8") && defSide.volatile[di]?.surviveOnce!==true && damage>=defSide.hp[di]){damage=Math.max(0,defSide.hp[di]-1);defSide.volatile[di].surviveOnce=true;survivedByAbility=true;b.log.push(`${d.name}の特性「${ab.name||aid}」で攻撃を耐えた！`);break;}
+  }
+  if(!survivedByAbility && hasFullHpSurvival(d,moveType) && defSide.hp[di]===defSide.maxHp[di] && damage>=defSide.hp[di]){damage=Math.max(1,defSide.hp[di]-1);b.log.push(`${d.name}はHP満タンの効果で攻撃を1残して耐えた！`);}
+  defSide.hp[di]=Math.max(0,defSide.hp[di]-damage);
+  if(defSide.hp[di]>0) triggerHalfHpHeal(b,defSide,di);
+  if(defSide.hp[di]>0 && move.contact){
+    if(abilityHasEffect(d,"contact_revenge")){
+      const rd=Math.max(1,Math.floor(defSide.maxHp[di]/8));
+      attSide.hp[ai]=Math.max(0,attSide.hp[ai]-rd);
+      b.log.push(`${a.name}は${d.name}の特性で最大HPの1/8のダメージを受けた！`);
+    }
+    const revengeItem=itemWorks(d,moveType);
+    if(revengeItem?.effect==="contact_revenge_item"){
+      const rd=Math.max(1,Math.floor(defSide.maxHp[di]/8));
+      attSide.hp[ai]=Math.max(0,attSide.hp[ai]-rd);
+      b.log.push(`${a.name}は${d.name}の持ち物「${revengeItem.name||itemId(d)}」で最大HPの1/8のダメージを受けた！`);
+    }
+  }
+  if(survivedByAbility){const extra=Math.max(1,Math.floor(defSide.maxHp[di]/8));defSide.hp[di]=Math.max(1,defSide.hp[di]-extra);b.log.push(`${d.name}は特性で攻撃を一度耐え、その後最大HPの1/8を失った！`);}
+  const extra=r.mult>1?" 効果はばつぐんだ！":r.mult<1?" 効果はいまひとつのようだ。":"";
+  const typeNote=r.moveType!==move.type?`（タイプが${r.moveType}）`:"";
+  b.log.push(`${a.name}の${move.name}！${typeNote} ${d.name}に${damage}ダメージ。${extra}`);
+
+  const recoilItem=getItem(itemId(a));
+  if(recoilItem?.effect==="life_orb"&&defSide.hp[di]>0){const rd=Math.max(1,Math.floor(attSide.maxHp[ai]/10));attSide.hp[ai]=Math.max(0,attSide.hp[ai]-rd);b.log.push(`${a.name}はいのちのたまで反動を受けた。`);}
+  if(recoilItem?.effect==="power_1_3_recoil"&&defSide.hp[di]>0){const rd=Math.max(1,Math.floor(attSide.maxHp[ai]/16));attSide.hp[ai]=Math.max(0,attSide.hp[ai]-rd);b.log.push(`${a.name}は持ち物の反動で最大HPの1/16を失った。`);}
+  for(const aid of abilityIds(a)){const ab=getAbility(aid);if(!abilityEffects(ab).includes("power_1_3_recoil")||!effectTypesMatch(ab,move.type))continue;const rd=Math.max(1,Math.floor(attSide.maxHp[ai]/16));attSide.hp[ai]=Math.max(0,attSide.hp[ai]-rd);b.log.push(`${a.name}は特性の反動で最大HPの1/16を失った。`);break;}
+
+  if(defSide.hp[di]>0 && effects.includes("remove_item") && chance() && itemId(d)){const oldItem=getItem(itemId(d));d.itemId=null;d.item=null;defSide.itemLost[di]=true;b.log.push(`${d.name}の持ち物「${oldItem?.name||""}」がなくなった！`);}
+  if(defSide.hp[di]>0 && effects.includes("change_opponent_type") && chance()){const types=Array.isArray(move.effectAddTypes)?move.effectAddTypes.filter(t=>ALL_TYPES.includes(t)):[move.effectAddType].filter(t=>ALL_TYPES.includes(t));d.type=types;b.log.push(`${d.name}のタイプが${types.length?types.join("・"):"なし"}になった！`);}
+  if(defSide.hp[di]>0 && (move.status||effects.includes("inflict_status")) && chance() && move.status) setStatus(b,defSide,di,move.status,move.category==="status");
+  if(defSide.hp[di]>0 && effects.includes("flinch") && chance()) defSide.volatile[di].flinch=true;
+  if(defSide.hp[di]>0 && effects.includes("attack_then_switch")){const alive=attSide.selected.filter(x=>x!==ai&&attSide.hp[x]>0);if(alive.length){b.log.push(`${a.name}は攻撃後に交代する！`);switched=true;}}
+  return {switched};
+}
+function megaEvolve(b,side){
+  if(side.megaUsed) throw new Error("この対戦ではすでにメガ進化しています。");
+  const i=side.active, p=side.team[i], m=p.mega;
+  const heldItem=getItem(itemId(p));
+  if(!heldItem || heldItem.effect!=="mega_stone") throw new Error(`${p.name}はメガストーンを持っていないためメガ進化できません。`);
+  if(!m?.enabled) throw new Error(`${p.name}はメガ進化できません。`);
+  if(!m.stats || Object.values(m.stats).some(v=>!Number(v))) throw new Error("メガ進化後のステータスが設定されていません。");
+  p.name=m.name||`メガ${p.name}`;
+  p.type=Array.isArray(m.type)&&m.type.length?m.type:p.type;
+  p.abilities=m.ability?[m.ability]:p.abilities;
+  p.stats={...p.stats,...m.stats};
+  p._mega=true; side.megaUsed=true;
+  const oldMax=side.maxHp[i], newMax=statValue(p,"hp");
+  const hpRatio=oldMax>0?side.hp[i]/oldMax:1;
+  side.maxHp[i]=newMax; side.hp[i]=Math.max(1,Math.min(newMax,Math.floor(newMax*hpRatio)));
+  b.log.push(`${p.name}がメガ進化した！`);
+  applySwitchIn(b,side);
+}
+
+function chooseEnemyMove(b){
+  const p=b.enemy.team[b.enemy.active], ids=Array.isArray(p.moves)?p.moves:[];
+  const usable=ids.map(getMove).filter(Boolean);return usable[Math.floor(Math.random()*usable.length)]||{id:"tackle",name:"たいあたり",type:"ノーマル",power:40,category:"physical",priority:0};
+}
+function priorityWithAbility(b,side,move,otherSide){
+  let p=Number(move.priority||0);
+  if(move.category==="status" && abilityHasEffect(side.team[side.active],"status_priority_plus_1")){
+    const other=otherSide?.team?.[otherSide.active];
+    if(!speciesTypes(other).includes("あく")) p+=1;
+    else b.log.push(`${side.team[side.active].name}はあくタイプの相手に対して特性の優先度上昇効果を発揮できない！`);
+  }
+  return p;
+}
+function chooseTurnOrder(b,pm,em){
+  const pp=priorityWithAbility(b,b.player,pm,b.enemy);
+  const ep=priorityWithAbility(b,b.enemy,em,b.player);
+  if(pp!==ep)return pp>ep?["player","enemy"]:["enemy","player"];
+  const ps=effectiveSpeed(b.player,b.player.team[b.player.active]),es=effectiveSpeed(b.enemy,b.enemy.team[b.enemy.active]);
+  if(ps===es)return Math.random()<0.5?["player","enemy"]:["enemy","player"];
+  return ps>es?["player","enemy"]:["enemy","player"];
+}
+function chooseEnemySwitch(b){
+  const alive=b.enemy.selected.filter(i=>b.enemy.hp[i]>0&&i!==b.enemy.active);
+  if(!alive.length)return null;
+  if(b.enemy.hp[b.enemy.active]>0 && b.enemy.hp[b.enemy.active]>b.enemy.maxHp[b.enemy.active]/2)return null;
+  return alive.sort((x,y)=>b.enemy.hp[x]-b.enemy.hp[y]).pop();
+}
+function resolveFaints(b){
+  for(const side of [b.player,b.enemy]){
+    const i=side.active;
+    if(side.hp[i]>0)continue;
+    if(!side.logFainted?.[i]){side.logFainted=side.logFainted||{};side.logFainted[i]=true;b.log.push(`${side.team[i].name}は戦闘不能！`);}
+    const alive=side.selected.filter(x=>side.hp[x]>0);
+    if(!alive.length){b.over=true;b.result=side===b.player?"lose":"win";b.log.push(side===b.player?"自分の3匹が戦闘不能。あなたの敗北です。":"相手の3匹が戦闘不能。あなたの勝利です！");continue;}
+    if(side===b.enemy){const n=chooseEnemySwitch(b);if(n!==null&&n!==undefined){side.active=n;b.log.push(`相手は${side.team[n].name}を繰り出した！`);applySwitchIn(b,side);}}
+    else if(!b.over){ b.phase="switch_required"; b.log.push("戦闘不能になったため、次のポケモンを選んでください。"); }
+  }
+}
+function prepareTurn(b){b.player.protected.fill(false);b.enemy.protected.fill(false);for(const s of [b.player,b.enemy]){const v=s.volatile[s.active];if(v)v.flinch=false;}}
+function runTurn(b,playerMoveId){
+  const pm=getMove(String(playerMoveId));if(!pm)throw new Error("技が見つかりません。");
+  const p=b.player.team[b.player.active];if(!Array.isArray(p.moves)||!p.moves.map(String).includes(String(pm.id)))throw new Error("その技は使用できません。");
+  const em=chooseEnemyMove(b);prepareTurn(b);
+  const order=chooseTurnOrder(b,pm,em);
+  for(const who of order){
+    if(b.over)break;
+    const as=who==="player"?b.player:b.enemy,ds=who==="player"?b.enemy:b.player,m=who==="player"?pm:em;
+    if(as.hp[as.active]<=0)continue;
+    if(as.volatile[as.active]?.flinch){b.log.push(`${as.team[as.active].name}はひるんで動けない！`);continue;}
+    const result=doMove(b,as,ds,m);
+    resolveFaints(b);
+    if(!b.over && result?.switched && as.hp[as.active]>0){
+      if(as===b.player){ b.phase="switch_required"; }
+      else { const n=chooseEnemySwitch(b); if(n!==null&&n!==undefined){as.active=n;b.log.push(`相手は${as.team[n].name}を繰り出した！`);applySwitchIn(b,as);} }
+    }
+    if(b.phase==="switch_required") break;
+  }
+  if(!b.over && b.phase==="battle"){endTurnSide(b,b.player);endTurnSide(b,b.enemy);resolveFaints(b);}
+  if(!b.over && b.phase==="battle"){
+    if(b.weather){b.weatherTurns--;if(b.weatherTurns<=0){b.log.push(`天候の${WEATHER_NAMES[b.weather]||b.weather}が消えた！`);b.weather=null;b.weatherTurns=0;}}
+    if(b.field){b.fieldTurns--;if(b.fieldTurns<=0){b.log.push(`フィールドの${FIELD_NAMES[b.field]||b.field}が消えた！`);b.field=null;b.fieldTurns=0;}}
+    for(const side of [b.player,b.enemy]) for(const w of Object.keys(WALL_NAMES)){if(side.walls[w]>0){side.walls[w]--;if(side.walls[w]===0)b.log.push(`${WALL_NAMES[w]}が消えた！`);}}
+    b.turn++;
+  }
+}
+
+app.post("/api/battle/start",requireLogin,(req,res)=>{
+  const ids=Array.isArray(req.body?.speciesIds)?req.body.speciesIds.map(String):[];
+  if(ids.length!==6||new Set(ids).size!==6)return res.status(400).json({error:"異なる登録済みポケモンを6匹選んでください。"});
+  try{const b=makeBattle(ids);req.session.battle=b;res.json(publicBattle(b));}catch(e){res.status(400).json({error:e.message});}
+});
+app.get("/api/battle",requireLogin,(req,res)=>res.json(req.session.battle?publicBattle(req.session.battle):null));
+app.post("/api/battle/select",requireLogin,(req,res)=>{
+  const b=req.session.battle;if(!b||b.over)return res.status(400).json({error:"対戦がありません。"});
+  const indexes=Array.isArray(req.body?.indexes)?req.body.indexes.map(Number):[];
+  if(indexes.length!==3||new Set(indexes).size!==3||indexes.some(i=>i<0||i>=6))return res.status(400).json({error:"3匹ちょうど選出してください。"});
+  b.player.selected=indexes;b.player.active=indexes[0];b.phase="battle";b.log.push(`自分の選出: ${indexes.map(i=>b.player.team[i].name).join("・")}`);b.log.push(`相手の選出: ${b.enemy.selected.map(i=>b.enemy.team[i].name).join("・")}`);applySwitchIn(b,b.player);applySwitchIn(b,b.enemy);
+  req.session.save(()=>res.json(publicBattle(b)));
+});
+app.post("/api/battle/action",requireLogin,(req,res)=>{
+  const b=req.session.battle;if(!b||b.over||b.phase!=="battle")return res.status(400).json({error:"進行中の対戦がありません。"});
+  try{
+    if(req.body?.type==="mega"){
+      megaEvolve(b,b.player);
+      const em=chooseEnemyMove(b); prepareTurn(b); doMove(b,b.enemy,b.player,em); resolveFaints(b);
+    }else if(req.body?.type==="switch"){
+      const index=Number(req.body.index);
+      if(!b.player.selected.includes(index)||index===b.player.active||b.player.hp[index]<=0)throw new Error("そのポケモンには交代できません。");
+      const old=b.player.team[b.player.active].name;b.player.active=index;b.log.push(`${old}から${b.player.team[index].name}に交代した。`);applySwitchIn(b,b.player);
+      if(b.phase==="switch_required"){b.phase="battle";b.turn++;}
+      else {
+        const em=chooseEnemyMove(b);
+        prepareTurn(b);
+        // 手動交代への反応で「ボルトチェンジ」等の追加交代効果まで連鎖しないようにする。
+        // 攻撃自体は通常どおり行うが、attack_then_switch はこの場面では無効。
+        const responseMove={...em,effects:moveEffectsOf(em).filter(e=>e!=="attack_then_switch")};
+        responseMove.effect=responseMove.effects[0]||null;
+        const r=doMove(b,b.enemy,b.player,responseMove);
+        resolveFaints(b);
+      }
+    }else if(req.body?.type==="move"){runTurn(b,String(req.body.moveId));}
+    else throw new Error("不正な行動です。");
+    req.session.save(()=>res.json(publicBattle(b)));
+  }catch(e){res.status(400).json({error:e.message||"行動に失敗しました。"});}
+});
+app.get("/health", (req, res) => res.status(200).json({ ok: true }));
+
+app.get("/", (req, res) => {
+  const user = currentUser(req);
+  if (!user || !user.enabled) return res.sendFile(path.join(__dirname, "public", "login.html"));
+  return res.redirect(user.role === "developer" ? "/admin" : "/app.html");
+});
+app.get("/app.html", requirePageLogin, (req,res)=>res.sendFile(path.join(__dirname,"public","app.html")));
+app.get("/admin", requireDeveloperPage, (req,res)=>res.sendFile(path.join(__dirname,"public","admin.html")));
+app.get("/login.html", (req,res)=>res.sendFile(path.join(__dirname,"public","login.html")));
+app.get("/favicon.ico", (req,res)=>res.status(204).end());
+
+if (require.main === module) app.listen(PORT, () => console.log(`Pokemon battle simulator: http://localhost:${PORT}`));
+module.exports = app;
