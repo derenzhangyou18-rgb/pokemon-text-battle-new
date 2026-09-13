@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>開発者管理 | 文字だけポケモン</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:#0b0d12;color:#edf1f7;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+.app{width:min(1240px,calc(100% - 32px));margin:auto;padding:28px 0 60px}
+.top{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}
+.eyebrow{font-size:11px;letter-spacing:.16em;color:#98a2b3}.muted{color:#98a2b3}h1,h2,h3{margin-top:0}
+.panel{background:#12161d;border:1px solid #2a313d;border-radius:16px;padding:20px;margin-top:18px}
+.grid{display:grid;grid-template-columns:320px 1fr;gap:18px}.list{max-height:680px;overflow:auto}.item{padding:10px;border:1px solid #2a313d;border-radius:10px;background:#181d26;margin-bottom:8px;cursor:pointer}.item.active{border-color:#edf2f7}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.two{display:grid;grid-template-columns:1fr 1fr;gap:10px}.three{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.six{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+label{display:grid;gap:7px;color:#aab3c0;font-size:12px;margin:9px 0}input,select,button{font:inherit}input,select{width:100%;background:#181d26;border:1px solid #2a313d;border-radius:10px;color:#edf1f7;padding:10px}select[multiple]{min-height:120px}
+input[type=checkbox]{width:auto}.checkgrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.check{display:flex;align-items:center;gap:7px;background:#181d26;border:1px solid #2a313d;border-radius:9px;padding:9px;color:#edf1f7;font-size:13px}
+.section{border-top:1px solid #2a313d;margin-top:16px;padding-top:14px}.typegrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.typecheck{display:flex;align-items:center;gap:8px;background:#181d26;border:1px solid #2a313d;border-radius:9px;padding:9px;color:#edf1f7;font-size:13px;margin:0}.typecheck input{width:auto;margin:0}@media(max-width:560px){.typegrid{grid-template-columns:1fr 1fr}}.hint{font-size:12px;color:#98a2b3;line-height:1.6}.actions{position:sticky;bottom:10px;background:#12161d;padding-top:12px;margin-top:16px}
+.primary,.secondary{border-radius:10px;padding:11px 15px;border:1px solid #2a313d;cursor:pointer;text-decoration:none}.primary{background:#edf2f7;color:#0b0d12;font-weight:800}.secondary{background:#181d26;color:#edf1f7}.danger{border-color:#7d3030;color:#ff8b8b}.ok{color:#8ee6a7;min-height:20px}.error{color:#ff7777;min-height:20px}
+.badge{display:inline-block;border:1px solid #2a313d;border-radius:999px;padding:4px 8px;font-size:11px;color:#aab3c0}.hidden{display:none!important}
+@media(max-width:900px){.grid{grid-template-columns:1fr}.top{flex-direction:column}.two,.three,.six,.checkgrid{grid-template-columns:1fr 1fr}}
+@media(max-width:560px){.two,.three,.six,.checkgrid{grid-template-columns:1fr}.app{width:min(100% - 20px,1240px)}}
+</style>
+</head>
+<body>
+<main class="app">
+<header class="top">
+  <div><p class="eyebrow">DEVELOPER CONSOLE</p><h1>開発者管理</h1><p class="muted">ポケモン・技・特性・持ち物・相手パーティをフォームから登録できます。JSONを直接入力する必要はありません。</p></div>
+  <div class="row"><a class="secondary" href="app.html">対戦サイト</a><button class="secondary" id="logout">ログアウト</button></div>
+</header>
+
+<section class="panel">
+  <div class="grid">
+    <div>
+      <label>登録する種類
+        <select id="kind">
+          <option value="species">ポケモン</option>
+          <option value="move">技</option>
+          <option value="ability">特性</option>
+          <option value="item">持ち物</option>
+          <option value="enemy_team">相手パーティ</option>
+        </select>
+      </label>
+      <div class="row">
+        <button class="primary" id="new">新規登録</button>
+        <button class="secondary" id="export">バックアップを書き出す</button>
+      </div>
+      <p id="msg" class="muted"></p>
+      <div id="list" class="list"></div>
+    </div>
+
+    <div>
+      <div id="form"></div>
+      <div class="actions row">
+        <button class="primary" id="save">保存</button>
+        <button class="secondary danger" id="delete">削除</button>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="panel">
+  <h2>登録の考え方</h2>
+  <p class="hint">IDは英数字で分かりやすく付けてください。たとえば「10まんボルト」のIDを <b>thunderbolt</b> にしたら、ポケモンの技欄でも同じIDを選びます。フォームで選択した内容は、対戦エンジンが使うデータ形式に変換してSupabaseへ保存されます。</p>
+</section>
+
+<section class="panel">
+  <h2>アカウント</h2>
+  <p class="hint">GitHub Pages版ではパスワードを独自DBに保存せず、Supabase Authを使用します。開発者権限はSupabase SQL Editorで設定します。</p>
+</section>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="config.js"></script>
+<script src="supabase-client.js"></script>
+<script>
+const $=id=>document.getElementById(id);
+let rows=[],allRows=[],selectedId=null;
+const TYPES=['ノーマル','ほのお','みず','でんき','くさ','こおり','かくとう','どく','じめん','ひこう','エスパー','むし','いわ','ゴースト','ドラゴン','あく','はがね','フェアリー'];
+const STATS=[['attack','攻撃'],['defense','防御'],['spAttack','特攻'],['spDefense','特防'],['speed','素早さ']];
+const STAT_ALL=[['hp','HP'],...STATS];
+const WEATHER=[['sun','はれ'],['rain','あめ'],['sand','すなあらし'],['snow','ゆき']];
+const FIELD=[['electric','エレキフィールド'],['grassy','グラスフィールド'],['misty','ミストフィールド'],['psychic','サイコフィールド']];
+const WALLS=[['light_screen','ひかりのかべ'],['reflect','リフレクター'],['aurora_veil','オーロラベール']];
+const STATUS=[['burn','やけど'],['paralysis','まひ'],['poison','どく'],['toxic','もうどく'],['sleep','ねむり'],['freeze','こおり']];
+const MOVE_EFFECTS=[
+ ['swords_dance','つるぎのまい'],['nasty_plot','わるだくみ'],['dragon_dance','りゅうのまい'],['stat_boost','能力上昇'],['stat_drop','能力下降'],
+ ['inflict_status','状態異常'],['flinch','ひるみ'],['remove_item','持ち物をなくす'],['change_opponent_type','相手のタイプ変更'],['attack_then_switch','攻撃後に交代'],
+ ['stealth_rock','ステルスロック'],['spikes','まきびし'],['set_weather','天候変更'],['set_field','フィールド変更'],['light_screen','ひかりのかべ'],['reflect','リフレクター'],['aurora_veil','オーロラベール'],
+ ['protect','まもる'],['recover','HP回復'],['item_power_1_5','持ち物を持つ相手への威力1.5倍'],['grassy_power_half','グラスフィールドで威力半減'],['wall_break','壁を無視']
+];
+const ABILITY_EFFECTS=[
+ ['intimidate','いかく'],['drizzle','あめふらし'],['drought','ひでり'],['swift_swim','すいすい'],['chlorophyll','ようりょくそ'],['blaze','もうか'],['torrent','げきりゅう'],['huge_power','ちからもち'],
+ ['slow_start','スロースタート'],['no_burn','やけど無効'],['no_paralysis','まひ無効'],['no_intimidate','いかく無効'],['type_immune','特定タイプ無効'],['status_immune','変化技無効'],['full_hp_survive','HP満タン時に1残して耐える'],
+ ['full_hp_damage_half','HP満タン時に受けるダメージ半減'],['survive_once_1_8','一度だけ攻撃を耐える'],['contact_damage_half','接触技のダメージ半減'],['contact_revenge','接触技を受けた相手に反撃ダメージ'],['contact_power_1_3','接触技の威力1.3倍'],
+ ['power_1_2','対応タイプの技の威力1.2倍'],['power_1_3_recoil','対応タイプの技の威力1.3倍＋反動'],['power_1_5_under_60','威力60未満の技1.5倍'],['faint_ally_power_1_1','瀕死の味方数に応じて威力上昇'],
+ ['received_type_stat_boost','特定タイプの技を受けると能力上昇'],['change_move_type','技タイプ変更'],['first_move_type','最初に使った技のタイプになる'],['entry_attack_drop','登場時に相手の攻撃下降'],
+ ['set_weather','登場時に天候変更'],['set_field','登場時にフィールド変更'],['status_priority_plus_1','変化技の優先度+1'],['no_miss_both','双方の技を必中扱い']
+];
+const ITEM_EFFECTS=[
+ ['leftovers','たべのこし'],['life_orb','いのちのたま'],['choice_scarf','こだわりスカーフ'],['choice_1_5_lock','こだわり系（能力1.5倍＋技固定）'],['choice_attack_1_5','攻撃1.5倍＋技固定'],['choice_spAttack_1_5','特攻1.5倍＋技固定'],['choice_speed_1_5','素早さ1.5倍＋技固定'],
+ ['stat_boost','登場時に能力上昇'],['stat_drop','登場時に能力下降'],['contact_revenge_item','接触技を受けた相手に反撃ダメージ'],['power_1_2','技の威力1.2倍'],['power_1_3_recoil','技の威力1.3倍＋反動'],['half_hp_heal_quarter','HP半分以下でHP1/4回復'],
+ ['field_seed','フィールドで能力上昇して消費'],['weather_extend','対応天候を5ターン延長'],['field_extend','対応フィールドを5ターン延長'],['wall_extend','対応壁を5ターン延長'],['full_hp_survive','HP満タン時に1残して耐える'],['mega_stone','メガストーン']
+];
+const labelMap=o=>Object.fromEntries(o.map(x=>[x[0],x[1]]));
+const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const opts=(arr,selected)=>arr.map(([v,n])=>`<option value="${esc(v)}" ${Array.isArray(selected)?selected.includes(v)?'selected':'':selected===v?'selected':''}>${esc(n)}</option>`).join('');
+const multi=(id,arr,selected=[],size=6)=>`<select id="${id}" multiple size="${size}">${opts(arr,selected)}</select>`;
+const typeMulti=(id,selected=[])=>`<div class="typegrid">${TYPES.map(t=>`<label class="typecheck"><input type="checkbox" name="${esc(id)}" value="${esc(t)}" ${selected.includes(t)?'checked':''}><span>${esc(t)}</span></label>`).join('')}</div>`;
+const typeChoice=(id,selected='',allowNone=true,max=1)=>{const vals=Array.isArray(selected)?selected:(selected?[selected]:[]);const none=allowNone?`<label class="typecheck"><input type="checkbox" name="${esc(id)}" value="" data-type-choice="${esc(id)}" ${vals.length===0?'checked':''}><span>なし</span></label>`:'';return `<div class="typegrid">${none}${TYPES.map(t=>`<label class="typecheck"><input type="checkbox" name="${esc(id)}" value="${esc(t)}" data-type-choice="${esc(id)}" ${vals.includes(t)?'checked':''}><span>${esc(t)}</span></label>`).join('')}</div>`};
+const one=(id,arr,selected='')=>`<select id="${id}"><option value="">-- 選択 --</option>${opts(arr,selected)}</select>`;
+function values(id){const el=$(id);if(el&&el.selectedOptions)return [...el.selectedOptions].map(x=>x.value);return [...document.querySelectorAll(`input[name="${CSS.escape(id)}"]:checked`)].map(x=>x.value);}
+function num(id,def=''){const v=$(id)?.value;return v===''?def:Number(v)}
+function bool(id){return !!$(id)?.checked}
+function show(t,ok=false){$('msg').className=ok?'ok':'muted';$('msg').textContent=t}
+function speciesRows(){return allRows.filter(r=>r.kind==='species')}
+function abilityRows(){return allRows.filter(r=>r.kind==='ability')}
+function itemRows(){return allRows.filter(r=>r.kind==='item')}
+function moveRows(){return allRows.filter(r=>r.kind==='move')}
+function dataOf(r){return r?.data||{}}
+function idName(r){const d=dataOf(r);return `${d.name||d.id||'(名前なし)'} (${d.id||r.id})`}
+function idOptions(list,selected=[]){return list.map(r=>{const d=dataOf(r);return [String(d.id||''),d.name||d.id||String(r.id)]}) .filter(x=>x[0])}
+
+function commonFields(d={}){
+  return `<div class="two"><label>ID<input id="dataId" value="${esc(d.id||'')}" placeholder="例: pikachu"></label><label>名前<input id="dataName" value="${esc(d.name||'')}" placeholder="表示名"></label></div>`;
+}
+function statFields(d={}){
+  const s=d.stats||{},e=d.evs||{};
+  return `<div class="section"><h3>能力値</h3><div class="six">${STAT_ALL.map(([k,n])=>`<label>${n}<input id="stat_${k}" type="number" min="0" max="999" value="${Number(s[k]??(k==='hp'?100:70))}"></label>`).join('')}</div><p class="hint">ゲーム内の計算式に使う基礎値です。努力値は下の欄で設定します。</p><h3>努力値</h3><div class="six">${STAT_ALL.map(([k,n])=>`<label>${n}<input id="ev_${k}" type="number" min="0" max="32" value="${Number(e[k]??0)}"></label>`).join('')}</div></div>`;
+}
+function speciesForm(d={}){
+ const nature=d.personality||{};
+ return commonFields(d)+`<div class="section"><h3>タイプ</h3>${typeMulti('types',d.type||[])}</div>${statFields(d)}
+ <div class="section"><h3>性格補正</h3><div class="two"><label>上昇する能力${one('natureUp',[['','なし'],...STATS],nature.up||'')}</label><label>下降する能力${one('natureDown',[['','なし'],...STATS],nature.down||'')}</label></div></div>
+ <div class="section"><h3>特性</h3>${multi('abilities',idOptions(abilityRows()),d.abilities||[],4)}<p class="hint">登録済みの特性から選びます。通常は1つ以上を選択してください。</p></div>
+ <div class="section"><h3>持ち物</h3>${one('itemId',[['','なし'],...idOptions(itemRows())],d.itemId||d.item||'')}</div>
+ <div class="section"><h3>技</h3>${multi('moves',idOptions(moveRows()),d.moves||[],4)}<p class="hint">通常は4技まで。IDを直接入力する必要はありません。</p></div>
+ <div class="section"><h3>メガ進化（必要な場合だけ）</h3><label class="check"><input id="megaEnabled" type="checkbox" ${d.mega?.enabled?'checked':''}> メガ進化可能</label><div class="two"><label>メガ後の名前<input id="megaName" value="${esc(d.mega?.name||'')}" placeholder="メガ○○"></label><label>メガ後の特性${one('megaAbility',idOptions(abilityRows()),d.mega?.ability||'')}</label></div><label>メガ後のタイプ${typeMulti('megaType',d.mega?.type||[])}</label><div class="six">${STATS.map(([k,n])=>`<label>メガ後${n}<input id="mega_${k}" type="number" min="0" value="${Number(d.mega?.stats?.[k]??(d.stats?.[k]??70))}"></label>`).join('')}</div></div>`;
+}
+function moveForm(d={}){
+ const effects=d.effects?.length?d.effects:(d.effect?[d.effect]:[]);
+ return commonFields(d)+`<div class="section"><h3>基本設定</h3><div class="three"><label>タイプ${typeChoice('moveType',d.type||'ノーマル',false,1)}</label><label>分類${one('category',[['physical','物理'],['special','特殊'],['status','変化']],d.category||'physical')}</label><label>対象${one('target',[['opponent','相手'],['self','自分'],['field','場']],d.target||'opponent')}</label></div><div class="three"><label>威力<input id="power" type="number" min="0" value="${Number(d.power??0)}"></label><label>命中率<input id="accuracy" type="number" min="0" max="100" value="${Number(d.accuracy??100)}"></label><label>優先度<input id="priority" type="number" min="-7" max="7" value="${Number(d.priority??0)}"></label></div><label class="check"><input id="contact" type="checkbox" ${d.contact?'checked':''}> 接触技</label></div>
+ <div class="section"><h3>追加効果</h3>${multi('moveEffects',MOVE_EFFECTS,effects,9)}<label>追加効果の発動率（%）<input id="effectChance" type="number" min="0" max="100" value="${Number(d.effectChance??100)}"></label></div>
+ <div class="section"><h3>能力変化</h3><div class="three"><label>対象${one('effectTarget',[['self','自分'],['opponent','相手']],d.effectTarget||'self')}</label><label>能力${one('effectStat',STATS,d.effectStat||'attack')}</label><label>段階<input id="effectStages" type="number" min="1" max="3" value="${Number(d.effectStages??1)}"></label></div></div>
+ <div class="section"><h3>状態異常</h3>${one('status',[['','なし'],...STATUS],d.status||'')}</div>
+ <div class="section"><h3>天候・フィールド</h3><div class="two"><label>天候${one('weather',[['','なし'],...WEATHER],d.weather||'')}</label><label>天候ターン数<input id="duration" type="number" min="1" max="99" value="${Number(d.duration??5)}"></label><label>フィールド${one('field',[['','なし'],...FIELD],d.field||'')}</label><label>フィールドターン数<input id="fieldDuration" type="number" min="1" max="99" value="${Number(d.fieldDuration??d.duration??5)}"></label></div></div>
+ <div class="section"><h3>相手タイプ変更</h3><div class="two"><label>変更後タイプ1${typeChoice('effectAddType',d.effectAddType||'',true,1)}</label><label>変更後タイプ2${typeChoice('effectAddType2',Array.isArray(d.effectAddTypes)?d.effectAddTypes[1]||'':'',true,1)}</label></div><p class="hint">2つ選ぶと2タイプになります。1つだけなら単タイプです。</p></div>
+ <div class="section"><h3>特別設定</h3><label>この技が無効になる相手タイプ${typeMulti('ineffectiveTypes',d.ineffectiveTypes||[])}</label></div>`;
+}
+function abilityForm(d={}){
+ const effects=d.effects?.length?d.effects:(d.effect?[d.effect]:[]);
+ return commonFields(d)+`<div class="section"><h3>特性効果</h3>${multi('abilityEffects',ABILITY_EFFECTS,effects,10)}<p class="hint">複数選択できます。たとえば「特定タイプ無効」＋「能力上昇」のような組み合わせも可能です。</p></div>
+ <div class="section"><h3>タイプ条件</h3><label>このタイプの技にだけ効果を発揮${typeMulti('effectTypes',d.effectTypes||[])}</label></div>
+ <div class="section"><h3>能力変化</h3><div class="three"><label>能力${one('effectStat',STATS,d.effectStat||'attack')}</label><label>段階<input id="effectStages" type="number" min="1" max="3" value="${Number(d.effectStages??1)}"></label><label>対象${one('effectTarget',[['self','自分'],['opponent','相手']],d.effectTarget||'self')}</label></div></div>
+ <div class="section"><h3>タイプ無効・技タイプ変更</h3><label>無効にするタイプ${typeMulti('immuneTypes',d.immuneTypes||[])}</label><div class="two"><label>変更する技タイプ${typeChoice('effectMoveType',d.effectMoveType||'',true,1)}</label><label>受けた技のタイプ${typeChoice('receivedMoveType',d.receivedMoveType||'',true,1)}</label></div></div>
+ <div class="section"><h3>受けた技で能力上昇</h3><div class="two"><label>上昇する能力${one('receivedStat',[['','なし'],...STATS],d.receivedStat||'')}</label><label>上昇段階<input id="receivedStages" type="number" min="1" max="3" value="${Number(d.receivedStages??1)}"></label></div></div>
+ <div class="section"><h3>天候・フィールド</h3><div class="two"><label>天候${one('weather',[['','なし'],...WEATHER],d.weather||'')}</label><label>天候ターン数<input id="weatherDuration" type="number" min="1" max="99" value="${Number(d.weatherDuration??5)}"></label><label>フィールド${one('field',[['','なし'],...FIELD],d.field||'')}</label><label>フィールドターン数<input id="fieldDuration" type="number" min="1" max="99" value="${Number(d.fieldDuration??5)}"></label></div></div>`;
+}
+function itemForm(d={}){
+ const effect=d.effect||'';
+ return commonFields(d)+`<div class="section"><h3>持ち物効果</h3>${one('itemEffect',ITEM_EFFECTS,effect)}</div>
+ <div class="section"><h3>タイプ条件</h3><label>このタイプの技にだけ効果${typeMulti('effectTypes',d.effectTypes||[])}</label></div>
+ <div class="section"><h3>能力変化</h3><div class="three"><label>能力${one('effectStat',STATS,d.effectStat||'attack')}</label><label>段階<input id="effectStages" type="number" min="1" max="3" value="${Number(d.effectStages??1)}"></label><label>対象${one('effectTarget',[['self','自分'],['opponent','相手']],d.effectTarget||'self')}</label></div></div>
+ <div class="section"><h3>こだわり・フィールド・天候・壁</h3><label>能力補正の対象${multi('choiceStats',STATS,d.choiceStats||[],5)}</label><div class="three"><label>対応天候${one('effectWeather',[['','なし'],...WEATHER],d.effectWeather||'')}</label><label>対応フィールド${one('effectField',[['','なし'],...FIELD],d.effectField||'')}</label><label>対応壁${one('effectWall',[['','なし'],...WALLS],d.effectWall||'')}</label></div><label>フィールドシードの条件${one('seedField',[['','なし'],...FIELD],d.seedField||'')}</label></div>
+ <div class="section"><h3>消費設定</h3><label class="check"><input id="consume" type="checkbox" ${d.consume!==false?'checked':''}> 効果発動後に持ち物を消費する</label></div>`;
+}
+function enemyForm(d={}){
+ const ids=Array.isArray(d.species)?d.species:[];const list=idOptions(speciesRows());
+ return commonFields(d)+`<div class="section"><h3>相手パーティ</h3>${[0,1,2,3,4,5].map(i=>`<label>${i+1}匹目${one('enemy_'+i,[['','なし'],...list],ids[i]||'')}</label>`).join('')}<label>最初に選出する3匹${multi('enemySelected',[['0','1匹目'],['1','2匹目'],['2','3匹目'],['3','4匹目'],['4','5匹目'],['5','6匹目']],(d.selected||[0,1,2]).map(String),6)}</label><p class="hint">相手パーティは3匹以上必要です。最大6匹まで登録できます。</p></div>`;
+}
+function renderForm(d={}){
+ const k=$('kind').value;let html='';
+ if(k==='species')html=speciesForm(d); else if(k==='move')html=moveForm(d); else if(k==='ability')html=abilityForm(d); else if(k==='item')html=itemForm(d); else html=enemyForm(d);
+ $('form').innerHTML=html;
+}
+function collect(){
+ const k=$('kind').value,id=$('dataId').value.trim(),name=$('dataName').value.trim();
+ if(!id)throw new Error('IDを入力してください。'); if(!name)throw new Error('名前を入力してください。');
+ if(k==='species'){
+   const abilities=values('abilities'),moves=values('moves'),types=values('types'); if(!types.length)throw new Error('タイプを1つ以上選択してください。'); if(moves.length>4)throw new Error('技は4つまで選択してください。');
+   const stats={},evs={}; STAT_ALL.forEach(([x])=>{stats[x]=num('stat_'+x,0);evs[x]=Math.max(0,Math.min(32,num('ev_'+x,0)))});
+   const obj={id,name,type:types,stats,evs,personality:{},abilities,moves};
+   const up=$('natureUp').value,down=$('natureDown').value;if(up)obj.personality.up=up;if(down)obj.personality.down=down;
+   const item=$('itemId').value;if(item)obj.itemId=item;
+   if(bool('megaEnabled')){const ms={};STATS.forEach(([x])=>ms[x]=num('mega_'+x,0));obj.mega={enabled:true,name:$('megaName').value.trim()||`メガ${name}`,ability:$('megaAbility').value||null,type:values('megaType'),stats:ms};}
+   return obj;
+ }
+ if(k==='move'){
+   const effects=values('moveEffects');const status=$('status').value;if(status&&!effects.includes('inflict_status'))effects.push('inflict_status');
+   const moveType=values('moveType').filter(Boolean)[0]||'';if(!moveType)throw new Error('技タイプを1つ選択してください。');
+   const obj={id,name,type:moveType,category:$('category').value,power:num('power',0),accuracy:num('accuracy',100),priority:num('priority',0),contact:bool('contact'),target:$('target').value,effects,effectChance:num('effectChance',100),effectStat:$('effectStat').value,effectStages:num('effectStages',1),effectTarget:$('effectTarget').value};
+   if(status)obj.status=status; const weather=$('weather').value;if(weather)obj.weather=weather;obj.duration=num('duration',5);const field=$('field').value;if(field)obj.field=field;obj.fieldDuration=num('fieldDuration',5);
+   const t1=values('effectAddType').filter(Boolean)[0]||'',t2=values('effectAddType2').filter(Boolean)[0]||'';if(t1||t2)obj.effectAddTypes=[t1,t2].filter(Boolean);if(obj.effectAddTypes?.length===1)obj.effectAddType=obj.effectAddTypes[0];
+   const ine=values('ineffectiveTypes');if(ine.length)obj.ineffectiveTypes=ine;
+   return obj;
+ }
+ if(k==='ability'){
+   const effects=values('abilityEffects');if(!effects.length)throw new Error('特性効果を1つ以上選択してください。');
+   const effectMoveType=values('effectMoveType').filter(Boolean)[0]||'',receivedMoveType=values('receivedMoveType').filter(Boolean)[0]||'';
+   const obj={id,name,effects,effectTypes:values('effectTypes'),effectStat:$('effectStat').value,effectStages:num('effectStages',1),effectTarget:$('effectTarget').value,immuneTypes:values('immuneTypes'),effectMoveType,receivedMoveType,receivedStat:$('receivedStat').value,receivedStages:num('receivedStages',1)};
+   const w=$('weather').value;if(w){obj.weather=w;obj.weatherDuration=num('weatherDuration',5)} const f=$('field').value;if(f){obj.field=f;obj.fieldDuration=num('fieldDuration',5)}
+   if(!obj.effectTypes.length)delete obj.effectTypes;if(!obj.immuneTypes.length)delete obj.immuneTypes;if(!obj.effectMoveType)delete obj.effectMoveType;if(!obj.receivedMoveType)delete obj.receivedMoveType;if(!obj.receivedStat)delete obj.receivedStat;if(!w){delete obj.weather;delete obj.weatherDuration}if(!f){delete obj.field;delete obj.fieldDuration}
+   return obj;
+ }
+ if(k==='item'){
+   const effect=$('itemEffect').value;if(!effect)throw new Error('持ち物効果を選択してください。');
+   const obj={id,name,effect,effectTypes:values('effectTypes'),effectStat:$('effectStat').value,effectStages:num('effectStages',1),effectTarget:$('effectTarget').value,choiceStats:values('choiceStats'),effectWeather:$('effectWeather').value,effectField:$('effectField').value,effectWall:$('effectWall').value,seedField:$('seedField').value,consume:bool('consume')};
+   if(!obj.effectTypes.length)delete obj.effectTypes;if(!obj.choiceStats.length)delete obj.choiceStats;if(!obj.effectWeather)delete obj.effectWeather;if(!obj.effectField)delete obj.effectField;if(!obj.effectWall)delete obj.effectWall;if(!obj.seedField)delete obj.seedField;
+   return obj;
+ }
+ const species=[];for(let i=0;i<6;i++){const v=$('enemy_'+i).value;if(v)species.push(v)}if(species.length<3)throw new Error('相手ポケモンを3匹以上選択してください。');const selected=values('enemySelected').map(Number).filter(i=>i<species.length);if(selected.length!==3)throw new Error('相手の選出を3匹選択してください。');return {id,name,species,selected};
+}
+function fillForm(d){renderForm(d)}
+async function auth(){if(!SB){show('config.jsを設定してください。');return false}const {data:{session}}=await SB.auth.getSession();if(!session){location.href='login.html';return false}const {data:p}=await SB.from('profiles').select('username,role,enabled').eq('id',session.user.id).single();if(!p||p.role!=='developer'||p.enabled===false){location.href='app.html';return false}return true}
+async function loadAll(){const {data,error}=await SB.from('content').select('id,kind,data').order('id');if(error){show(error.message);return}allRows=data||[];rows=allRows.filter(r=>r.kind===$('kind').value);renderList();renderForm({})}
+function renderList(){$('list').innerHTML=rows.map(r=>`<div class="item ${r.id===selectedId?'active':''}" data-id="${r.id}"><b>${esc(dataOf(r).name||dataOf(r).id||'(名前なし)')}</b><br><span class="muted">${esc(dataOf(r).id||r.id)}</span></div>`).join('')||'<p class="muted">登録なし</p>';document.querySelectorAll('[data-id]').forEach(x=>x.onclick=()=>edit(Number(x.dataset.id)))}
+function edit(id){const r=rows.find(x=>x.id===id);if(!r)return;selectedId=id;renderForm(dataOf(r));renderList()}
+$('kind').onchange=async()=>{selectedId=null;await loadAll()};
+
+document.addEventListener('change',e=>{const el=e.target;if(!el.matches('input[data-type-choice]'))return;const group=el.dataset.typeChoice;const boxes=[...document.querySelectorAll(`input[data-type-choice="${CSS.escape(group)}"]`)];const checked=boxes.filter(x=>x.checked);if(!el.checked)return;if(el.value===''){boxes.forEach(x=>{if(x!==el)x.checked=false});return}boxes.filter(x=>x.value==='').forEach(x=>x.checked=false);const max=1;if(checked.length>max){boxes.filter(x=>x!==el&&x.checked).forEach(x=>x.checked=false)}});
+$('new').onclick=()=>{selectedId=null;renderForm({});renderList();show('新規登録フォームです。')};
+$('save').onclick=async()=>{try{const obj=collect(),kind=$('kind').value;if(selectedId){const {error}=await SB.from('content').update({data:obj,updated_at:new Date().toISOString()}).eq('id',selectedId);if(error)throw error}else{const {error}=await SB.from('content').insert({kind,data:obj});if(error)throw error}show('保存しました。',true);await loadAll()}catch(e){show(e.message||String(e))}};
+$('delete').onclick=async()=>{if(!selectedId)return show('削除するデータを選択してください。');if(!confirm('このデータを削除しますか？'))return;const {error}=await SB.from('content').delete().eq('id',selectedId);if(error)return show(error.message);selectedId=null;show('削除しました。',true);await loadAll()};
+$('export').onclick=()=>{const blob=new Blob([JSON.stringify(allRows.map(r=>({kind:r.kind,data:r.data})),null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='pokemon-content-backup.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),0)};
+$('logout').onclick=async()=>{await SB.auth.signOut();location.href='login.html'};
+(async()=>{if(await auth())await loadAll()})();
+</script>
+</body>
+</html>
